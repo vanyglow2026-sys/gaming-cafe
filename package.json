@@ -1,0 +1,28 @@
+{
+  "name": "gaming-cafe-management",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Gaming Cafe Operations & Financial Management System",
+  "scripts": {
+    "dev:all": "node dev-runner.js",
+    "dev": "node dev-runner.js",
+    "dev:qr": "node dev-runner.js --qr",
+    "dev:global": "node dev-global.js",
+    "dev:backend": "node run-backend.js",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "build": "npm run build --prefix frontend",
+    "test:backend": "node run-backend.js --test",
+    "clean:test-data": "node run-backend.js --clean-test",
+    "clean:test-data:force": "node run-backend.js --clean-test --force",
+    "seed:admin": "node run-backend.js --seed-admin",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}

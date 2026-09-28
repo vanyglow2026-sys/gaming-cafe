@@ -1,0 +1,1538 @@
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
+from typing import List, Optional
+import uuid
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status, Body
+from sqlalchemy import select, delete, or_, and_, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.api.deps import get_db, get_optional_auth_user, require_admin_role
+from app.core.config import settings
+from app.core.security import create_admin_token
+from app.models.entities import Station, Session, Order, OrderItem, MenuItem, User
+from app.models.enums import SessionStatus, OrderStatus, PaymentStatus, StationStatus
+from app.schemas.api_schemas import (
+    StationLiveResponse,
+    StationCreate,
+    StationResponse,
+    UpdateStationRequest,
+    CheckInRequest,
+    TransferRequest,
+    CheckoutRequest,
+    CheckoutResponse,
+    OrderStatusUpdateRequest,
+    OrderResponse,
+    TokenResponse,
+    LoginRequest,
+    MenuItemCreate,
+    MenuItemUpdate,
+    MenuItemResponse,
+    InventoryRestockRequest,
+    CustomerProfileResponse,
+    StationOrderCreateRequest,
+    CategoryAvailabilityResponse,
+    SessionStartRequest,
+    SessionResponse,
+    StationMatrixResponse,
+    SessionExtendRequest,
+)
+from app.services.order_service import serialize_order, ensure_utc, CURRENCY_QUANTIZATION, sum_order_charges
+from app.services.session_service import (
+    check_in,
+    transfer_station,
+    settle_checkout,
+    with_transaction_retry,
+    get_fleet_categories,
+    start_category_session,
+    extend_session,
+    get_fleet_matrix,
+    _compute_time_charge,
+)
+from app.services.ws_notifier import buffer_ws_event
+
+router = APIRouter(prefix="/admin", tags=["Admin Operations"])
+
+
+@router.get("/fleet/categories", response_model=List[CategoryAvailabilityResponse])
+async def get_fleet_experience_categories(db: AsyncSession = Depends(get_db)):
+    """
+    Returns the 4 top-level Experience Categories (Solo, Multiplayer, CAR Simulator, VR Simulator)
+    with real-time aggregate device availability.
+    """
+    return await get_fleet_categories(db)
+
+
+@router.get("/fleet/matrix", response_model=StationMatrixResponse)
+@router.get("/matrix", response_model=StationMatrixResponse)
+async def get_console_fleet_matrix(db: AsyncSession = Depends(get_db)):
+    """
+    2D Station Allocation Matrix:
+    - Rows: Game Modes (Solo, Multiplayer, Car Simulator)
+    - Columns: Physical Stations (PS1, PS2, PS3)
+    """
+    return await get_fleet_matrix(db)
+
+
+@router.post("/sessions/start", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+async def start_experience_session_endpoint(
+    payload: SessionStartRequest,
+    auth_user: Optional[User] = Depends(get_optional_auth_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Starts an experience session on a shared physical device.
+    Enforces atomic conflict rejection if device (e.g. PS3 across Solo/Multiplayer/CAR) is busy.
+    Supports payload { station_id, mode, duration_minutes }.
+    """
+    user_id = auth_user.id if auth_user else None
+    customer_name = payload.customer_name or (auth_user.name if auth_user else "Gamer")
+    customer_phone = payload.customer_phone or (auth_user.phone if auth_user else None)
+    cat_id = payload.category_id or payload.mode or "solo"
+    dev_id = payload.device_id or payload.station_id
+
+    return await start_category_session(
+        db=db,
+        category_id=cat_id,
+        device_id=dev_id,
+        duration_minutes=payload.duration_minutes,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        user_id=user_id,
+        tier_price=payload.tier_price,
+    )
+
+
+@router.post("/sessions/{session_id}/extend")
+async def admin_extend_session_endpoint(
+    session_id: uuid.UUID,
+    payload: SessionExtendRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Extends an active session duration by specified minutes (+30m, +1h).
+    """
+    session = await extend_session(
+        db=db,
+        session_id=session_id,
+        minutes=payload.minutes,
+    )
+    return {
+        "message": f"Session extended by {payload.minutes} minutes",
+        "session_id": str(session.id),
+        "allocated_minutes": session.allocated_minutes,
+        "device_name": session.device_name,
+    }
+
+
+@router.post("/auth/login", response_model=TokenResponse)
+async def admin_login(creds: LoginRequest):
+    """
+    Admin authentication route generating an admin-scoped Bearer token.
+    """
+    if creds.username != settings.ADMIN_USERNAME or creds.password != settings.ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials",
+        )
+    token = create_admin_token(username=creds.username)
+    expires_in_seconds = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    return TokenResponse(access_token=token, scope="admin", expires_in=expires_in_seconds)
+
+
+@router.get("/stations/live", response_model=List[StationLiveResponse])
+async def get_live_stations(
+    auth_user: Optional[User] = Depends(get_optional_auth_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Live matrix showing station statuses, remaining times, and running totals.
+    Sanitizes private billing data for stations not owned by caller.
+    """
+    stmt = (
+        select(Station)
+        .options(
+            selectinload(Station.sessions.and_(Session.status == SessionStatus.ACTIVE.value))
+            .selectinload(Session.orders)
+            .selectinload(Order.items)
+            .selectinload(OrderItem.menu_item)
+        )
+        .order_by(Station.name)
+    )
+    result = await db.execute(stmt)
+    stations = result.scalars().all()
+
+    now = datetime.now(timezone.utc)
+    live_data: List[StationLiveResponse] = []
+    is_admin = bool(auth_user and getattr(auth_user, "role", "").upper() == "ADMIN")
+
+    # If canonical stations exist, keep top-level fleet distinct by excluding physical console rooms
+    has_canonical = any(s.name.lower() in ("solo", "multiplayer", "car simulator", "vr") for s in stations)
+    if has_canonical:
+        stations = [s for s in stations if s.name.upper() not in ("PS1", "PS2", "PS3", "VR1")]
+
+    for station in stations:
+        # Find active session (match by station_id or station_name)
+        active_session: Optional[Session] = None
+        for s in station.sessions:
+            if s.status == SessionStatus.ACTIVE.value:
+                active_session = s
+                break
+
+        if not active_session:
+            live_data.append(
+                StationLiveResponse(
+                    id=station.id,
+                    name=station.name,
+                    tier=station.tier,
+                    hourly_rate=station.hourly_rate,
+                    default_hourly_rate=station.hourly_rate,
+                    pricing_tiers=station.pricing_tiers or [],
+                    status=station.status,
+                    is_occupied=False,
+                    is_my_session=False,
+                    user_id=None,
+                    active_session_id=None,
+                    started_at=None,
+                    elapsed_minutes=0,
+                    remaining_minutes=None,
+                    time_charge=Decimal("0.00"),
+                    orders_charge=Decimal("0.00"),
+                    running_total=Decimal("0.00"),
+                    active_orders_count=0,
+                    device_name=None,
+                    allocated_console=None,
+                )
+            )
+        else:
+            started_at = ensure_utc(active_session.started_at)
+            elapsed_sec = (now - started_at).total_seconds()
+            elapsed_min = max(0, int(elapsed_sec // 60))
+            allocated_mins = active_session.allocated_minutes or settings.DEFAULT_SESSION_DURATION_MINUTES
+            remaining_min = max(0, allocated_mins - elapsed_min)
+
+            matches_user_id = bool(
+                auth_user is not None
+                and active_session.user_id is not None
+                and auth_user.id == active_session.user_id
+            )
+            matches_phone = bool(
+                auth_user is not None
+                and auth_user.phone
+                and active_session.customer_phone
+                and auth_user.phone.strip() == active_session.customer_phone.strip()
+            )
+            is_my_session = is_admin or matches_user_id or matches_phone
+
+            if not is_my_session:
+                # Sanitize response for non-owner: strip private billing details and session ID
+                live_data.append(
+                    StationLiveResponse(
+                        id=station.id,
+                        name=station.name,
+                        tier=station.tier,
+                        hourly_rate=station.hourly_rate,
+                        default_hourly_rate=station.hourly_rate,
+                        pricing_tiers=station.pricing_tiers or [],
+                        status=station.status,
+                        is_occupied=True,
+                        is_my_session=False,
+                        user_id=None,
+                        active_session_id=None,
+                        started_at=None,
+                        elapsed_minutes=0,
+                        remaining_minutes=remaining_min,
+                        time_charge=Decimal("0.00"),
+                        orders_charge=Decimal("0.00"),
+                        running_total=Decimal("0.00"),
+                        active_orders_count=0,
+                        device_name=active_session.device_name,
+                        allocated_console=active_session.device_name,
+                        customer_phone=None,
+                        customer_name=None,
+                    )
+                )
+            else:
+                time_charge = _compute_time_charge(
+                    tier_price=active_session.tier_price,
+                    elapsed_minutes=elapsed_min,
+                    allocated_minutes=allocated_mins,
+                    hourly_rate=station.hourly_rate,
+                    started_at=started_at,
+                    reference_time=now,
+                )
+
+                orders_charge = sum_order_charges(active_session.orders)
+                active_orders_count = sum(
+                    1 for o in active_session.orders
+                    if o.status in (OrderStatus.QUEUED.value, OrderStatus.PREPARING.value)
+                )
+
+                running_total = (time_charge + orders_charge).quantize(
+                    CURRENCY_QUANTIZATION
+                )
+
+                live_data.append(
+                    StationLiveResponse(
+                        id=station.id,
+                        name=station.name,
+                        tier=station.tier,
+                        hourly_rate=station.hourly_rate,
+                        default_hourly_rate=station.hourly_rate,
+                        pricing_tiers=station.pricing_tiers or [],
+                        status=station.status,
+                        is_occupied=True,
+                        is_my_session=True,
+                        user_id=active_session.user_id,
+                        active_session_id=active_session.id,
+                        started_at=active_session.started_at,
+                        elapsed_minutes=elapsed_min,
+                        remaining_minutes=remaining_min,
+                        time_charge=time_charge,
+                        orders_charge=orders_charge,
+                        running_total=running_total,
+                        active_orders_count=active_orders_count,
+                        device_name=active_session.device_name,
+                        allocated_console=active_session.device_name,
+                        customer_phone=active_session.customer_phone,
+                        customer_name=active_session.customer_name,
+                    )
+                )
+
+    return live_data
+
+
+@router.post("/stations", response_model=StationResponse, status_code=201)
+async def create_station(
+    payload: StationCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a new gaming station. Name must be unique.
+    """
+    # Check name uniqueness
+    existing = await db.execute(select(Station).where(Station.name == payload.name))
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A station named '{payload.name}' already exists.",
+        )
+
+    rate = payload.hourly_rate or payload.default_hourly_rate
+    if rate is None:
+        if payload.pricing_tiers:
+            first_tier = payload.pricing_tiers[0]
+            rate = Decimal(str(first_tier.price)) * Decimal(str(60 / first_tier.duration_min))
+        else:
+            rate = Decimal(str(settings.DEFAULT_HOURLY_RATE))
+
+    tiers_data = [t.model_dump(mode="json") for t in payload.pricing_tiers] if payload.pricing_tiers else []
+    station = Station(
+        name=payload.name,
+        tier=payload.tier or "CONSOLE",
+        hourly_rate=rate,
+        pricing_tiers=tiers_data,
+    )
+    db.add(station)
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="STATION_UPDATED",
+        payload={"station_id": str(station.id), "name": station.name, "action": "CREATE"},
+    )
+    buffer_ws_event(
+        db,
+        channel="customer",
+        event_type="STATION_UPDATED",
+        payload={"station_id": str(station.id), "name": station.name, "action": "CREATE"},
+    )
+    await db.commit()
+    await db.refresh(station)
+    return station
+
+
+@router.patch("/stations/{station_id}", response_model=StationResponse)
+async def update_station(
+    station_id: uuid.UUID,
+    payload: UpdateStationRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update station name, tier, hourly rate, pricing tiers or status.
+    """
+    result = await db.execute(select(Station).where(Station.id == station_id).with_for_update())
+    station = result.scalar_one_or_none()
+    if not station:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Station not found")
+
+    if payload.name is not None:
+        # Check name uniqueness (exclude self)
+        dup = await db.execute(select(Station).where(Station.name == payload.name, Station.id != station_id))
+        if dup.scalar_one_or_none():
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Name '{payload.name}' is already taken.")
+        station.name = payload.name
+    if payload.tier is not None:
+        station.tier = payload.tier
+    if payload.hourly_rate is not None:
+        station.hourly_rate = payload.hourly_rate
+    elif payload.default_hourly_rate is not None:
+        station.hourly_rate = payload.default_hourly_rate
+    if payload.pricing_tiers is not None:
+        station.pricing_tiers = [t.model_dump(mode="json") for t in payload.pricing_tiers]
+    if payload.status is not None:
+        allowed_statuses = {"AVAILABLE", "MAINTENANCE", "RESERVED"}
+        if payload.status not in allowed_statuses:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Status must be one of {allowed_statuses}")
+        station.status = payload.status
+
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="STATION_UPDATED",
+        payload={"station_id": str(station.id), "name": station.name, "action": "UPDATE"},
+    )
+    buffer_ws_event(
+        db,
+        channel="customer",
+        event_type="STATION_UPDATED",
+        payload={"station_id": str(station.id), "name": station.name, "action": "UPDATE"},
+    )
+    await db.commit()
+    await db.refresh(station)
+    return station
+
+
+@router.delete("/stations/{station_id}", status_code=204)
+async def delete_station(
+    station_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a station. Blocked if there is an active session.
+    """
+    result = await db.execute(
+        select(Station)
+        .options(selectinload(Station.sessions))
+        .where(Station.id == station_id)
+        .with_for_update()
+    )
+    station = result.scalar_one_or_none()
+    if not station:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Station not found")
+
+    active = any(s.status == "ACTIVE" for s in station.sessions)
+    if active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot delete a station with an active session. Check out first.",
+        )
+
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="STATION_UPDATED",
+        payload={"station_id": str(station_id), "action": "DELETE"},
+    )
+    buffer_ws_event(
+        db,
+        channel="customer",
+        event_type="STATION_UPDATED",
+        payload={"station_id": str(station_id), "action": "DELETE"},
+    )
+    await db.delete(station)
+    await db.commit()
+
+
+@router.post("/sessions/check-in")
+@router.post("/station/checkin")
+async def admin_check_in(
+    payload: CheckInRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Station check-in handler. Acquires exclusive FOR UPDATE lock and starts ACTIVE session.
+    Enforces concurrency checks against upcoming confirmed advance bookings.
+    """
+    target_station_id = payload.station_id
+    assigned_device_id = payload.device_id
+
+    # Resolve UUID if station_id was provided as a string or device name
+    if isinstance(target_station_id, str):
+        try:
+            target_station_id = uuid.UUID(target_station_id)
+        except (ValueError, TypeError):
+            # Lookup station by name (e.g. "Solo", "Multiplayer", "PS1", "Car Simulator")
+            stmt = select(Station).where(func.upper(Station.name) == target_station_id.strip().upper())
+            found_st = (await db.execute(stmt)).scalar_one_or_none()
+            if found_st:
+                target_station_id = found_st.id
+            else:
+                # If target_station_id is a physical device like 'PS1', 'PS2', 'PS3', 'VR1'
+                if not assigned_device_id and target_station_id.strip().upper() in ("PS1", "PS2", "PS3", "VR1"):
+                    assigned_device_id = target_station_id.strip().upper()
+                stmt_fallback = select(Station).where(func.upper(Station.name) == "SOLO")
+                fallback_st = (await db.execute(stmt_fallback)).scalar_one_or_none()
+                if fallback_st:
+                    target_station_id = fallback_st.id
+                else:
+                    first_st = (await db.execute(select(Station).limit(1))).scalar_one_or_none()
+                    if first_st:
+                        target_station_id = first_st.id
+                    else:
+                        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Station not found")
+
+    session = await check_in(
+        db=db,
+        station_id=target_station_id,
+        allocated_minutes=payload.allocated_minutes or settings.DEFAULT_SESSION_DURATION_MINUTES,
+        customer_name=payload.customer_name,
+        customer_phone=payload.customer_phone,
+        user_id=payload.user_id,
+        tier_price=payload.tier_price,
+        device_id=assigned_device_id,
+    )
+    return {
+        "message": "Station checked in successfully",
+        "session_id": str(session.id),
+        "station_id": str(session.station_id),
+        "device_name": session.device_name,
+        "console": session.device_name,
+        "room": session.device_name,
+    }
+
+
+@router.post("/sessions/transfer")
+async def admin_transfer_station(
+    payload: TransferRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Lexicographically locked station transfer to eliminate deadlocks.
+    """
+    session = await transfer_station(
+        db=db,
+        session_id=payload.session_id,
+        target_station_id=payload.target_station_id,
+        target_device=payload.target_device,
+    )
+    return {
+        "message": "Session transferred successfully",
+        "session_id": str(session.id),
+        "new_station_id": str(session.station_id),
+        "new_device_name": session.device_name,
+    }
+
+
+@router.post("/checkout", response_model=CheckoutResponse)
+@router.post("/sessions/checkout", response_model=CheckoutResponse)
+async def admin_checkout(
+    payload: CheckoutRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Settle running balance and output UPI QR payload or confirm cash payment.
+    Enforces idempotency and verifies no pending kitchen orders.
+    """
+    resolved_idempotency_key = idempotency_key or f"checkout-{payload.session_id}-{int(datetime.now().timestamp())}"
+    result = await settle_checkout(
+        db=db,
+        session_id=payload.session_id,
+        payment_method=payload.payment_method,
+        idempotency_key=resolved_idempotency_key,
+        discount_percent=payload.discount_percent,
+        discount_amount=payload.discount_amount,
+    )
+    return CheckoutResponse(**result)
+
+
+@router.get("/kitchen/orders", response_model=List[OrderResponse])
+async def get_kitchen_orders(
+    include_cancelled: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch all kitchen orders across active swimlanes (QUEUED, PREPARING, SERVED).
+    Strictly excludes CANCELLED and REJECTED orders by default.
+    """
+    stmt = (
+        select(Order)
+        .options(
+            selectinload(Order.items).selectinload(OrderItem.menu_item),
+            selectinload(Order.session).selectinload(Session.station),
+        )
+    )
+    if not include_cancelled:
+        stmt = stmt.where(
+            Order.status.notin_([OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value, "CANCELLED", "REJECTED"])
+        )
+    stmt = stmt.order_by(Order.created_at.desc())
+    result = await db.execute(stmt)
+    orders = result.scalars().all()
+    return [serialize_order(o) for o in orders]
+
+
+@router.patch("/kitchen/orders/{order_id}/status", response_model=OrderResponse)
+@with_transaction_retry()
+async def update_kitchen_order_status(
+    order_id: uuid.UUID,
+    payload: OrderStatusUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Updates KDS status (QUEUED ➔ PREPARING ➔ SERVED ➔ CANCELLED / REJECTED).
+    Buffers WebSocket events post-commit.
+    """
+    stmt = (
+        select(Order)
+        .where(Order.id == order_id)
+        .options(
+            selectinload(Order.items).selectinload(OrderItem.menu_item),
+            selectinload(Order.session).selectinload(Session.station),
+        )
+    )
+    res = await db.execute(stmt)
+    order = res.scalar_one_or_none()
+
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    old_status = order.status
+    new_status = payload.status.value if hasattr(payload.status, "value") else str(payload.status)
+
+    # 1. On Accept (transitioning from QUEUED to PREPARING/SERVED): Deduct inventory stock
+    if old_status == OrderStatus.QUEUED.value and new_status in (OrderStatus.PREPARING.value, OrderStatus.SERVED.value):
+        for itm in order.items:
+            if itm.menu_item:
+                itm.menu_item.stock = max(0, itm.menu_item.stock - itm.quantity)
+    is_reject_or_cancel = new_status in (OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value, "CANCELLED", "REJECTED")
+
+    # 2. On Cancel/Reject after having been accepted: Restore inventory stock
+    if old_status in (OrderStatus.PREPARING.value, OrderStatus.SERVED.value) and is_reject_or_cancel:
+        for itm in order.items:
+            if itm.menu_item:
+                itm.menu_item.stock = itm.menu_item.stock + itm.quantity
+
+    order.status = new_status
+
+    # If this was a Walk-in CAFE session and all its orders are now cancelled/rejected, cancel the session immediately
+    if is_reject_or_cancel and order.session_id:
+        active_other_stmt = select(Order.id).where(
+            Order.session_id == order.session_id,
+            Order.id != order.id,
+            Order.status.notin_([OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value, "CANCELLED", "REJECTED"]),
+        )
+        has_other_active = (await db.execute(active_other_stmt)).first() is not None
+        if not has_other_active:
+            sess = await db.get(Session, order.session_id)
+            if sess and sess.status == SessionStatus.ACTIVE.value:
+                is_cafe_sess = (
+                    (sess.category_id and any(c in sess.category_id.lower() for c in ("dine-in", "dine-out", "cafe")))
+                    or (sess.device_name and "cafe" in sess.device_name.lower())
+                    or (sess.station_name and "cafe" in sess.station_name.lower())
+                )
+                if is_cafe_sess:
+                    sess.status = SessionStatus.CANCELLED.value
+                    sess.ended_at = datetime.now(timezone.utc)
+                    buffer_ws_event(
+                        db,
+                        channel="admin",
+                        event_type="SESSION_CANCELLED",
+                        payload={"session_id": str(sess.id), "station_name": "Walk-in CAFE"},
+                    )
+
+    customer_message = (
+        "Order Accepted — Food is being prepared"
+        if new_status == OrderStatus.PREPARING.value
+        else "Order Served"
+        if new_status == OrderStatus.SERVED.value
+        else "Order Rejected"
+        if is_reject_or_cancel
+        else f"Order {new_status}"
+    )
+
+    # Buffer WebSocket event (ws_notifier automatically broadcasts to admin and customer)
+    station_id = str(order.session.station_id) if order.session else None
+    station_name = order.session.station.name if order.session and order.session.station else None
+
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="ORDER_STATUS_CHANGED",
+        payload={
+            "order_id": str(order.id),
+            "status": order.status,
+            "station_name": station_name,
+            "message": customer_message,
+        },
+    )
+    if station_id:
+        buffer_ws_event(
+            db,
+            channel=f"customer:{station_id}",
+            event_type="ORDER_STATUS_CHANGED",
+            payload={
+                "order_id": str(order.id),
+                "status": order.status,
+                "station_id": station_id,
+                "message": customer_message,
+            },
+        )
+
+    response_data = serialize_order(order)
+    await db.commit()
+    return response_data
+
+
+@router.delete("/kitchen/orders/{order_id}")
+@with_transaction_retry()
+async def delete_kitchen_order(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Permanently deletes or cancels an order from the database in real-time.
+    Restores inventory if PREPARING or SERVED.
+    If attached to Walk-in CAFE and no other active orders remain, cancels the session.
+    Broadcasts ORDER_DELETED and SESSION_CANCELLED real-time events.
+    """
+    stmt = (
+        select(Order)
+        .where(Order.id == order_id)
+        .options(
+            selectinload(Order.items).selectinload(OrderItem.menu_item),
+            selectinload(Order.session).selectinload(Session.station),
+        )
+    )
+    res = await db.execute(stmt)
+    order = res.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    # Restore inventory stock
+    for itm in order.items:
+        if itm.menu_item:
+            itm.menu_item.stock += itm.quantity
+
+    session_id = order.session_id
+    st_name = (
+        order.session.station.name
+        if (order.session and order.session.station)
+        else (order.session.station_name if order.session else "Desk")
+    )
+
+    # Delete order from database
+    await db.delete(order)
+    await db.flush()
+
+    # If this was attached to a Walk-in CAFE session, check if any other active orders remain
+    if session_id:
+        rem_stmt = select(Order.id).where(
+            Order.session_id == session_id,
+            Order.status.notin_([OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value, "CANCELLED", "REJECTED"]),
+        )
+        remaining = (await db.execute(rem_stmt)).first()
+        if not remaining:
+            sess = await db.get(Session, session_id)
+            if sess and sess.status == SessionStatus.ACTIVE.value:
+                is_cafe_sess = (
+                    (sess.category_id and any(c in sess.category_id.lower() for c in ("dine-in", "dine-out", "cafe")))
+                    or (sess.device_name and "cafe" in sess.device_name.lower())
+                    or (sess.station_name and "cafe" in sess.station_name.lower())
+                )
+                if is_cafe_sess:
+                    sess.status = SessionStatus.CANCELLED.value
+                    sess.ended_at = datetime.now(timezone.utc)
+                    buffer_ws_event(
+                        db,
+                        channel="admin",
+                        event_type="SESSION_CANCELLED",
+                        payload={"session_id": str(sess.id), "station_name": "Walk-in CAFE"},
+                    )
+
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="ORDER_DELETED",
+        payload={"order_id": str(order_id), "station_name": st_name},
+    )
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="ORDER_STATUS_CHANGED",
+        payload={
+            "order_id": str(order_id),
+            "status": "CANCELLED",
+            "station_name": st_name,
+            "message": "Order Deleted / Rejected",
+        },
+    )
+    await db.commit()
+    return {"message": "Order deleted successfully", "order_id": str(order_id)}
+
+
+@router.delete("/cafe/tab/{customer_name}")
+@router.post("/cafe/tab/delete")
+@with_transaction_retry()
+async def delete_cafe_customer_tab(
+    customer_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+    payload: Optional[dict] = Body(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Permanently deletes a Walk-in CAFE customer tab from the database in real-time:
+    1. Cancels active Walk-in CAFE sessions for this customer or session_id.
+    2. Restores inventory for preparing/served items.
+    3. Deletes or cancels all active orders for this customer / session.
+    4. Broadcasts ORDER_DELETED and SESSION_CANCELLED real-time events.
+    """
+    target_cust = customer_name
+    target_sess_id = session_id
+    if payload:
+        if not target_cust:
+            target_cust = payload.get("customer_name") or payload.get("name")
+        if not target_sess_id:
+            target_sess_id = payload.get("session_id")
+
+    clean_name = target_cust.strip() if target_cust else ""
+
+    # 1. Find matching active cafe sessions
+    sess_conditions = []
+    if target_sess_id:
+        try:
+            sess_uuid = uuid.UUID(str(target_sess_id).strip())
+            sess_conditions.append(Session.id == sess_uuid)
+        except ValueError:
+            pass
+    if clean_name:
+        sess_conditions.append(func.upper(Session.customer_name) == clean_name.upper())
+
+    matched_sessions: List[Session] = []
+    if sess_conditions:
+        sess_stmt = (
+            select(Session)
+            .where(
+                Session.status == SessionStatus.ACTIVE.value,
+                or_(*sess_conditions),
+                or_(
+                    Session.station_name.ilike("%cafe%"),
+                    Session.device_name.ilike("%cafe%"),
+                    Session.console_room.ilike("%cafe%"),
+                    Session.category_id.ilike("%cafe%"),
+                    Session.category_id.ilike("%dine%"),
+                ),
+            )
+            .options(selectinload(Session.station))
+        )
+        matched_sessions = (await db.execute(sess_stmt)).scalars().all()
+
+    session_ids = [s.id for s in matched_sessions]
+
+    # 2. Find matching orders
+    order_conditions = []
+    if session_ids:
+        order_conditions.append(Order.session_id.in_(session_ids))
+    if clean_name:
+        order_conditions.append(
+            and_(
+                func.upper(Order.customer_name) == clean_name.upper(),
+                Order.status.notin_([OrderStatus.CANCELLED.value, OrderStatus.REJECTED.value, "CANCELLED", "REJECTED"]),
+            )
+        )
+
+    orders_to_delete: List[Order] = []
+    if order_conditions:
+        order_stmt = (
+            select(Order)
+            .where(or_(*order_conditions))
+            .options(
+                selectinload(Order.items).selectinload(OrderItem.menu_item),
+                selectinload(Order.session),
+            )
+        )
+        orders_to_delete = (await db.execute(order_stmt)).scalars().all()
+
+    # 3. Restore inventory for preparing/served items and delete orders
+    for ord_obj in orders_to_delete:
+        if ord_obj.status in (OrderStatus.PREPARING.value, OrderStatus.SERVED.value, "PREPARING", "SERVED"):
+            for itm in ord_obj.items:
+                if itm.menu_item:
+                    itm.menu_item.stock += itm.quantity
+
+        buffer_ws_event(
+            db,
+            channel="admin",
+            event_type="ORDER_DELETED",
+            payload={"order_id": str(ord_obj.id), "station_name": "Walk-in CAFE"},
+        )
+        await db.delete(ord_obj)
+
+    # 4. Cancel active sessions
+    now_utc = datetime.now(timezone.utc)
+    for s in matched_sessions:
+        s.status = SessionStatus.CANCELLED.value
+        s.ended_at = now_utc
+        buffer_ws_event(
+            db,
+            channel="admin",
+            event_type="SESSION_CANCELLED",
+            payload={"session_id": str(s.id), "station_name": "Walk-in CAFE"},
+        )
+
+    await db.commit()
+    return {
+        "message": f"Walk-in CAFE tab for '{clean_name}' successfully deleted",
+        "deleted_orders_count": len(orders_to_delete),
+        "cancelled_sessions_count": len(matched_sessions),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Menu & Inventory Operations
+# ---------------------------------------------------------------------------
+
+@router.get("/menu", response_model=List[MenuItemResponse])
+async def get_admin_menu(db: AsyncSession = Depends(get_db)):
+    """
+    Fetch all menu items with active inventory stock levels.
+    """
+    stmt = select(MenuItem).order_by(MenuItem.category, MenuItem.name)
+    items = (await db.execute(stmt)).scalars().all()
+    return items
+
+
+@router.post("/menu", response_model=MenuItemResponse, status_code=status.HTTP_201_CREATED)
+async def create_menu_item(
+    payload: MenuItemCreate,
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Add a new item to the menu & inventory catalogue.
+    """
+    stmt = select(MenuItem).where(MenuItem.name == payload.name.strip())
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An item named '{payload.name}' already exists in the menu.",
+        )
+
+    item = MenuItem(
+        name=payload.name.strip(),
+        category=payload.category,
+        price=payload.price,
+        stock=payload.stock,
+        min_stock_alert=payload.min_stock_alert,
+        is_available=payload.is_available,
+    )
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.patch("/menu/{item_id}", response_model=MenuItemResponse)
+async def update_menu_item(
+    item_id: uuid.UUID,
+    payload: MenuItemUpdate,
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update item name, category, price, stock, or availability.
+    """
+    item = await db.get(MenuItem, item_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Menu item not found")
+
+    if payload.name is not None:
+        item.name = payload.name.strip()
+    if payload.category is not None:
+        item.category = payload.category
+    if payload.price is not None:
+        item.price = payload.price
+    if payload.stock is not None:
+        item.stock = payload.stock
+    if payload.min_stock_alert is not None:
+        item.min_stock_alert = payload.min_stock_alert
+    if payload.is_available is not None:
+        item.is_available = payload.is_available
+
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+@router.delete("/menu/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_menu_item(
+    item_id: uuid.UUID,
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Remove an item from the menu and inventory catalogue.
+    """
+    item = await db.get(MenuItem, item_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Menu item not found")
+
+    # Clean up any order items referencing this menu item to prevent FK violation
+    await db.execute(delete(OrderItem).where(OrderItem.menu_item_id == item_id))
+    await db.delete(item)
+    await db.commit()
+
+
+@router.post("/inventory/restock", response_model=MenuItemResponse)
+async def restock_inventory_item(
+    payload: InventoryRestockRequest,
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Adjust item quantity in inventory (supports positive additions or negative deductions).
+    Clamps stock to minimum 0.
+    """
+    item = await db.get(MenuItem, payload.item_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Menu item not found")
+
+    new_stock = item.stock + payload.amount
+    item.stock = max(0, new_stock)
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+
+# ---------------------------------------------------------------------------
+# Station Food Ordering (with real-time stock deduction)
+# ---------------------------------------------------------------------------
+
+@router.post("/orders/station-order", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+async def place_station_food_order(
+    payload: StationOrderCreateRequest,
+    auth_user: Optional[User] = Depends(get_optional_auth_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Places food order from station, atomically deducts stock in DB,
+    attaches to active session, and broadcasts ORDER_CREATED event to Kitchen Kanban.
+    Enforces server-side authorization: caller must be an admin or the session owner.
+    """
+    target_st_id_str = str(payload.station_id).strip()
+    target_sess_id_str = str(payload.session_id).strip() if payload.session_id else None
+
+    cafe_session = None
+
+    # 1. Direct session_id lookup if provided
+    if target_sess_id_str:
+        try:
+            sess_uuid = uuid.UUID(target_sess_id_str)
+            sess_stmt = (
+                select(Session)
+                .where(Session.id == sess_uuid, Session.status == SessionStatus.ACTIVE.value)
+                .options(selectinload(Session.station))
+            )
+            cafe_session = (await db.execute(sess_stmt)).scalar_one_or_none()
+        except ValueError:
+            pass
+
+    # 2. Resolve target station if possible
+    target_station = None
+    try:
+        st_uuid = uuid.UUID(target_st_id_str)
+        target_station = await db.get(Station, st_uuid)
+    except ValueError:
+        st_stmt = select(Station).where(
+            or_(
+                func.upper(Station.name) == target_st_id_str.upper(),
+                func.upper(Station.tier) == target_st_id_str.upper(),
+            )
+        )
+        target_station = (await db.execute(st_stmt)).scalar_one_or_none()
+
+    st_upper = target_st_id_str.upper()
+    is_cafe_order = (
+        "CAFE" in st_upper
+        or "DINE" in st_upper
+        or (
+            target_station is not None
+            and (
+                (target_station.tier and target_station.tier.upper() == "CAFE")
+                or "CAFE" in (target_station.name or "").upper()
+                or "DINE" in (target_station.name or "").upper()
+            )
+        )
+    )
+
+    clean_cust_name = payload.customer_name.strip() if payload.customer_name and payload.customer_name.strip() else ""
+    is_generic_name = clean_cust_name.lower() in ("", "customer", "walk-in guest", "walk-in cafe guest")
+
+    if is_cafe_order:
+        # Check if an existing active cafe session matches this customer
+        if not cafe_session and clean_cust_name and not is_generic_name:
+            existing_cafe_stmt = (
+                select(Session)
+                .where(
+                    Session.status == SessionStatus.ACTIVE.value,
+                    func.upper(Session.customer_name) == clean_cust_name.upper(),
+                    or_(
+                        Session.station_id == (target_station.id if target_station else None),
+                        func.upper(Session.station_name) == "WALK-IN CAFE",
+                        func.upper(Session.device_name) == "WALK-IN CAFE",
+                        func.upper(Session.console_room) == "WALK-IN CAFE",
+                        Session.category_id.ilike("%dine%"),
+                        Session.category_id.ilike("%cafe%"),
+                    ),
+                )
+                .options(selectinload(Session.station))
+            )
+            cafe_session = (await db.execute(existing_cafe_stmt)).scalars().first()
+
+        # If still no session, create a standalone Walk-in CAFE session
+        if not cafe_session:
+            if not target_station:
+                st_stmt = select(Station).where(func.upper(Station.name) == "WALK-IN CAFE")
+                target_station = (await db.execute(st_stmt)).scalar_one_or_none()
+                if not target_station:
+                    target_station = Station(
+                        name="Walk-in CAFE",
+                        tier="CAFE",
+                        hourly_rate=Decimal("0.00"),
+                        pricing_tiers=[],
+                        status=StationStatus.AVAILABLE.value,
+                    )
+                    db.add(target_station)
+                    await db.flush()
+
+            effective_cafe_cust = clean_cust_name if clean_cust_name and not is_generic_name else "Walk-in Cafe Guest"
+            cafe_session = Session(
+                station_id=target_station.id,
+                station_name=target_station.name or "Walk-in CAFE",
+                device_name=target_station.name or "Walk-in CAFE",
+                console_room=target_station.name or "Walk-in CAFE",
+                category_id="dine-in",
+                customer_name=effective_cafe_cust,
+                status=SessionStatus.ACTIVE.value,
+                started_at=datetime.now(timezone.utc),
+                allocated_minutes=0,
+                tier_price=Decimal("0.00"),
+            )
+            db.add(cafe_session)
+            await db.flush()
+
+    else:
+        # Standard gaming console station logic: must find active gaming session
+        if not cafe_session and target_station:
+            stmt = (
+                select(Session)
+                .where(Session.station_id == target_station.id, Session.status == SessionStatus.ACTIVE.value)
+                .options(selectinload(Session.station))
+            )
+            cafe_session = (await db.execute(stmt)).scalars().first()
+
+        if not cafe_session:
+            active_stmt = (
+                select(Session)
+                .join(Session.station, isouter=True)
+                .where(
+                    Session.status == SessionStatus.ACTIVE.value,
+                    or_(
+                        func.upper(Session.device_name) == st_upper,
+                        func.upper(Session.console_room) == st_upper,
+                        func.upper(Station.name) == st_upper,
+                    ),
+                )
+                .options(selectinload(Session.station))
+            )
+            cafe_session = (await db.execute(active_stmt)).scalars().first()
+
+        if not cafe_session:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No active playing session found on station '{target_st_id_str}'. Please verify the session is active before ordering snacks.",
+            )
+
+    # Authorization Check: Caller must be authenticated, and either ADMIN or session owner
+    if not auth_user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Authentication required to order food for a station session.",
+        )
+
+    is_admin = bool(getattr(auth_user, "role", "").upper() == "ADMIN")
+    if not is_admin:
+        if cafe_session.user_id is None or cafe_session.user_id != auth_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: You cannot order food for a station session you do not own.",
+            )
+
+    # 1. Create order
+    order = Order(
+        session_id=cafe_session.id,
+        customer_name=payload.customer_name or cafe_session.customer_name or "Station Player",
+        status=OrderStatus.QUEUED.value,
+    )
+    db.add(order)
+    await db.flush()
+
+    # 2. Batch fetch menu items to eliminate N+1 queries
+    item_ids = [itm.menu_item_id for itm in payload.items]
+    items_stmt = select(MenuItem).where(MenuItem.id.in_(item_ids))
+    menu_map = {m.id: m for m in (await db.execute(items_stmt)).scalars().all()}
+
+    order_items_to_add: List[OrderItem] = []
+    for itm in payload.items:
+        menu_item = menu_map.get(itm.menu_item_id)
+        if not menu_item:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Menu item '{itm.menu_item_id}' not found",
+            )
+        # If item is tracked in inventory with positive stock, deduct; if requesting more than stock, reject
+        if menu_item.stock is not None and menu_item.stock > 0:
+            if menu_item.stock < itm.quantity:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Insufficient stock for '{menu_item.name}'. Only {menu_item.stock} left in inventory.",
+                )
+            menu_item.stock -= itm.quantity
+        order_items_to_add.append(
+            OrderItem(
+                order_id=order.id,
+                menu_item_id=menu_item.id,
+                quantity=itm.quantity,
+                unit_price=menu_item.price,
+            )
+        )
+
+    db.add_all(order_items_to_add)
+    await db.flush()
+
+    # 3. Broadcast WebSocket event to kitchen
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="ORDER_CREATED",
+        payload={
+            "order_id": str(order.id),
+            "station_name": cafe_session.station.name if (cafe_session.station and cafe_session.station.name) else (cafe_session.station_name or "Walk-in CAFE"),
+            "customer_name": order.customer_name,
+        },
+    )
+
+    await db.commit()
+
+    # 4. Fetch hydrated order for response
+    order_stmt = (
+        select(Order)
+        .where(Order.id == order.id)
+        .options(
+            selectinload(Order.items).selectinload(OrderItem.menu_item),
+            selectinload(Order.session).selectinload(Session.station),
+        )
+    )
+    hydrated_order = (await db.execute(order_stmt)).scalar_one()
+    return serialize_order(hydrated_order)
+
+
+# ---------------------------------------------------------------------------
+# Customer Directory & Footfall Logs
+# ---------------------------------------------------------------------------
+
+@router.get("/customers", response_model=List[CustomerProfileResponse])
+async def get_customer_directory(
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Live aggregated customer directory querying registered players and sessions.
+    Computes total visits, last visit timestamp, and lifetime revenue in O(U + S) time.
+    """
+    users_stmt = select(User).where(User.role == "CUSTOMER").order_by(User.created_at.desc())
+    users = (await db.execute(users_stmt)).scalars().all()
+
+    sessions_stmt = select(Session).options(
+        selectinload(Session.orders).selectinload(Order.items)
+    )
+    all_sessions = (await db.execute(sessions_stmt)).scalars().all()
+
+    # Pre-index sessions by user_id and customer_phone in O(S) time
+    sessions_by_user: defaultdict[str, List[Session]] = defaultdict(list)
+    sessions_by_phone: defaultdict[str, List[Session]] = defaultdict(list)
+    for s in all_sessions:
+        if s.user_id:
+            sessions_by_user[str(s.user_id)].append(s)
+        if s.customer_phone:
+            sessions_by_phone[s.customer_phone].append(s)
+
+    out: List[CustomerProfileResponse] = []
+    seen_phones = set()
+    registered_session_ids = set()
+
+    for u in users:
+        u_phone_clean = (u.phone or "").strip()
+        if u_phone_clean:
+            seen_phones.add(u_phone_clean)
+
+        user_sess_map = {}
+        for s in sessions_by_user.get(str(u.id), []):
+            user_sess_map[s.id] = s
+        if u_phone_clean:
+            for s in sessions_by_phone.get(u_phone_clean, []):
+                user_sess_map[s.id] = s
+
+        u_sessions = list(user_sess_map.values())
+        for s in u_sessions:
+            registered_session_ids.add(s.id)
+
+        visit_count = len(u_sessions)
+        last_visit_str = None
+        if u_sessions:
+            sorted_s = sorted(u_sessions, key=lambda s: s.started_at, reverse=True)
+            last_visit_str = sorted_s[0].started_at.strftime("%d %b, %I:%M %p")
+
+        total_spent = Decimal("0.00")
+        for s in u_sessions:
+            if s.status == SessionStatus.COMPLETED.value:
+                total_spent += (s.total_amount if s.total_amount is not None else Decimal("0.00"))
+            else:
+                sess_time = s.tier_price or Decimal("0.00")
+                sess_orders = sum_order_charges(s.orders, statuses=["PREPARING", "SERVED"])
+                total_spent += (sess_time + sess_orders)
+
+        out.append(
+            CustomerProfileResponse(
+                id=str(u.id),
+                name=u.name,
+                phone=u.phone,
+                visit_count=visit_count,
+                last_visit=last_visit_str or u.created_at.strftime("%d %b, %I:%M %p"),
+                total_spent=float(total_spent),
+                notes="Registered Player",
+            )
+        )
+
+    # 2. Capture ALL walk-in player sessions (admin checkins and customer portal checkins)
+    unassigned_sessions = [s for s in all_sessions if s.id not in registered_session_ids]
+
+    walkin_groups: dict[str, List[Session]] = defaultdict(list)
+    for s in unassigned_sessions:
+        ph = (s.customer_phone or "").strip()
+        nm = (s.customer_name or "").strip()
+        if ph and ph not in seen_phones and len(ph) >= 7:
+            group_key = f"phone_{ph}"
+        elif nm and nm.lower() not in ("walk-in gamer", "gamer", "customer"):
+            group_key = f"name_{nm.lower()}"
+        else:
+            group_key = f"session_{str(s.id)}"
+        walkin_groups[group_key].append(s)
+
+    for group_key, s_list in walkin_groups.items():
+        sorted_s = sorted(s_list, key=lambda s: s.started_at, reverse=True)
+        primary_s = sorted_s[0]
+        name = primary_s.customer_name or "Walk-in Gamer"
+        phone = primary_s.customer_phone or "Walk-in"
+        last_visit_str = primary_s.started_at.strftime("%d %b, %I:%M %p")
+
+        total_spent = Decimal("0.00")
+        for s in s_list:
+            if s.status == SessionStatus.COMPLETED.value:
+                total_spent += (s.total_amount if s.total_amount is not None else Decimal("0.00"))
+            else:
+                sess_time = s.tier_price or Decimal("0.00")
+                sess_orders = sum_order_charges(s.orders, statuses=["PREPARING", "SERVED"])
+                total_spent += (sess_time + sess_orders)
+
+        out.append(
+            CustomerProfileResponse(
+                id=f"walkin_{group_key}",
+                name=name,
+                phone=phone,
+                visit_count=len(s_list),
+                last_visit=last_visit_str,
+                total_spent=float(total_spent),
+                notes="Walk-in Guest",
+            )
+        )
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Real-time Financial & Revenue Analytics (Direct Database Aggregation)
+# ---------------------------------------------------------------------------
+
+@router.get("/analytics/revenue")
+async def get_revenue_analytics(
+    period: str = "DAY",  # DAY, WEEK, MONTH
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Computes real-time revenue analytics directly from database sessions, payments, and orders.
+    Zero localStorage or mock data.
+    """
+    now = datetime.now(timezone.utc)
+    if period.upper() == "DAY":
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        days_to_show = 1
+    elif period.upper() == "WEEK":
+        cutoff = now - timedelta(days=7)
+        days_to_show = 7
+    else:
+        cutoff = now - timedelta(days=30)
+        days_to_show = 14
+
+    stmt = (
+        select(Session)
+        .where(Session.started_at >= cutoff)
+        .options(
+            selectinload(Session.orders).selectinload(Order.items).selectinload(OrderItem.menu_item),
+            selectinload(Session.payments),
+        )
+    )
+    result = await db.execute(stmt)
+    sessions = result.scalars().all()
+
+    total_revenue = Decimal("0.00")
+    gaming_revenue = Decimal("0.00")
+    food_revenue = Decimal("0.00")
+    cash_revenue = Decimal("0.00")
+    upi_revenue = Decimal("0.00")
+    cash_count = 0
+    upi_count = 0
+    sessions_count = len(sessions)
+    item_counts: dict[str, int] = defaultdict(int)
+
+    daily_stats: dict[str, dict[str, Decimal]] = defaultdict(
+        lambda: {
+            "total": Decimal("0.00"),
+            "gaming": Decimal("0.00"),
+            "food": Decimal("0.00"),
+            "cash": Decimal("0.00"),
+            "upi": Decimal("0.00"),
+        }
+    )
+
+    for s in sessions:
+        started_at = ensure_utc(s.started_at)
+        day_key = started_at.strftime("%Y-%m-%d")
+
+        s_total = s.total_amount if (s.total_amount is not None and s.total_amount > Decimal("0.00")) else Decimal("0.00")
+        s_food_charge = Decimal("0.00")
+        for o in s.orders:
+            if o.status not in (OrderStatus.CANCELLED.value, "REJECTED", "rejected"):
+                for itm in o.items:
+                    s_food_charge += (itm.unit_price * Decimal(str(itm.quantity))).quantize(
+                        CURRENCY_QUANTIZATION
+                    )
+                    name = itm.menu_item.name if itm.menu_item else "Item"
+                    item_counts[name] += itm.quantity
+
+        if s.status == SessionStatus.COMPLETED.value:
+            if s_total > Decimal("0.00"):
+                s_time_charge = max(Decimal("0.00"), s_total - s_food_charge)
+            else:
+                s_time_charge = Decimal("0.00")
+                s_total = s_time_charge + s_food_charge
+        else:
+            s_time_charge = s.tier_price or Decimal("0.00")
+            s_total = s_time_charge + s_food_charge
+
+        gaming_revenue += s_time_charge
+        food_revenue += s_food_charge
+        total_revenue += s_total
+
+        # Reconcile Payment Method attribution (Cash vs UPI/QR)
+        s_cash = Decimal("0.00")
+        s_upi = Decimal("0.00")
+        completed_payments = [
+            p for p in (s.payments or [])
+            if getattr(p, "status", None) in (PaymentStatus.COMPLETED.value, "COMPLETED")
+        ]
+
+        if completed_payments:
+            p_cash = sum(
+                (p.amount for p in completed_payments if "CASH" in (p.method or "").upper()),
+                Decimal("0.00"),
+            )
+            p_upi = sum(
+                (p.amount for p in completed_payments if "UPI" in (p.method or "").upper()),
+                Decimal("0.00"),
+            )
+            paid_sum = p_cash + p_upi
+            if paid_sum > Decimal("0.00"):
+                s_cash = (s_total * (p_cash / paid_sum)).quantize(CURRENCY_QUANTIZATION)
+                s_upi = s_total - s_cash
+            else:
+                s_cash = s_total
+
+            cash_items = len([p for p in completed_payments if "CASH" in (p.method or "").upper()])
+            upi_items = len([p for p in completed_payments if "UPI" in (p.method or "").upper()])
+            cash_count += cash_items
+            upi_count += upi_items
+        elif s.status == SessionStatus.COMPLETED.value and s_total > Decimal("0.00"):
+            # Default to Cash for completed sessions without explicit payment rows
+            s_cash = s_total
+            cash_count += 1
+
+        cash_revenue += s_cash
+        upi_revenue += s_upi
+
+        daily_stats[day_key]["gaming"] += s_time_charge
+        daily_stats[day_key]["food"] += s_food_charge
+        daily_stats[day_key]["total"] += s_total
+        daily_stats[day_key]["cash"] += s_cash
+        daily_stats[day_key]["upi"] += s_upi
+
+    average_session_bill = (
+        float(total_revenue / Decimal(str(sessions_count))) if sessions_count > 0 else 0.0
+    )
+
+    top_item = "None"
+    if item_counts:
+        top_item = max(item_counts.items(), key=lambda x: x[1])[0]
+
+    chart_data = []
+    for i in range(days_to_show - 1, -1, -1):
+        d = now - timedelta(days=i)
+        d_key = d.strftime("%Y-%m-%d")
+        label = d.strftime("%a, %b %d") if days_to_show > 1 else "Today"
+        day_stat = daily_stats.get(
+            d_key,
+            {
+                "total": Decimal("0.00"),
+                "gaming": Decimal("0.00"),
+                "food": Decimal("0.00"),
+                "cash": Decimal("0.00"),
+                "upi": Decimal("0.00"),
+            },
+        )
+        chart_data.append({
+            "label": label,
+            "total": float(day_stat["total"]),
+            "gaming": float(day_stat["gaming"]),
+            "food": float(day_stat["food"]),
+            "cash": float(day_stat["cash"]),
+            "upi": float(day_stat["upi"]),
+        })
+
+    return {
+        "totalRevenue": float(total_revenue),
+        "gamingRevenue": float(gaming_revenue),
+        "foodRevenue": float(food_revenue),
+        "cashRevenue": float(cash_revenue),
+        "upiRevenue": float(upi_revenue),
+        "cashCount": cash_count,
+        "upiCount": upi_count,
+        "sessionsCount": sessions_count,
+        "averageSessionBill": round(average_session_bill, 2),
+        "topSellingItem": top_item,
+        "chartData": chart_data,
+    }
+

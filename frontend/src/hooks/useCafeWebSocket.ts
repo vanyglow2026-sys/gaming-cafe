@@ -1,0 +1,301 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { WebSocketEvent } from '../types';
+import { useLoungeStore } from '../store/loungeStore';
+import { env } from '../config/env';
+
+interface UseCafeWebSocketOptions {
+  channel: string;
+  onEvent?: (event: WebSocketEvent) => void;
+}
+
+export function useCafeWebSocket({ channel, onEvent }: UseCafeWebSocketOptions) {
+  const queryClient = useQueryClient();
+  const [isConnected, setIsConnected] = useState(false);
+  const [lastEvent, setLastEvent] = useState<WebSocketEvent | null>(null);
+
+  const socketRef = useRef<WebSocket | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimeoutRef = useRef<number | null>(null);
+  const pingIntervalRef = useRef<number | null>(null);
+  const isUnmountedRef = useRef(false);
+  const onEventRef = useRef(onEvent);
+
+  useEffect(() => {
+    onEventRef.current = onEvent;
+  }, [onEvent]);
+
+  const debounceTimerRef = useRef<number | null>(null);
+  const pendingKeysRef = useRef<Set<string>>(new Set());
+
+  const triggerDebouncedInvalidate = useCallback((keys: string[]) => {
+    keys.forEach((k) => pendingKeysRef.current.add(k));
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = window.setTimeout(() => {
+      const keysToInvalidate = Array.from(pendingKeysRef.current);
+      pendingKeysRef.current.clear();
+      keysToInvalidate.forEach((k) => {
+        queryClient.invalidateQueries({ queryKey: [k] });
+        queryClient.refetchQueries({ queryKey: [k], type: 'active' });
+      });
+    }, 40);
+  }, [queryClient]);
+
+  // Listen for local cross-tab / bus sync events to invalidate queries instantaneously
+  useEffect(() => {
+    const handleSync = () => {
+      triggerDebouncedInvalidate([
+        'station-matrix',
+        'stations-live',
+        'fleet-categories',
+        'customer-sessions',
+        'kitchen-orders',
+        'admin-customers',
+      ]);
+    };
+    window.addEventListener('vanya_sync_invalidate', handleSync);
+    return () => window.removeEventListener('vanya_sync_invalidate', handleSync);
+  }, [triggerDebouncedInvalidate]);
+
+  const clearPingInterval = () => {
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
+    }
+  };
+
+  const connect = useCallback(() => {
+    if (isUnmountedRef.current) return;
+
+    // Build WebSocket URL: prioritize direct backend WebSocket endpoint if set
+    let wsUrl: string;
+    if (typeof window !== 'undefined') {
+      const host = window.location.hostname;
+      const isLocalhost = host === 'localhost' || host === '127.0.0.1';
+      const envWs = env.VITE_WS_URL || (import.meta.env.VITE_WS_URL as string | undefined);
+
+      if (envWs) {
+        let baseWs = envWs.trim().replace(/\/+$/, '');
+        if (baseWs.startsWith('http://')) baseWs = baseWs.replace(/^http:\/\//, 'ws://');
+        else if (baseWs.startsWith('https://')) baseWs = baseWs.replace(/^https:\/\//, 'wss://');
+        else if (baseWs.startsWith('wsss://')) baseWs = baseWs.replace(/^wsss:\/\//, 'wss://');
+        wsUrl = `${baseWs}/ws/${channel}`;
+      } else if (isLocalhost) {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsUrl = `${protocol}//${window.location.host}/ws/${channel}`;
+      } else {
+        console.warn(
+          `[WebSocket] VITE_WS_URL environment variable is missing for channel "${channel}". WebSocket connection skipped to prevent broken local loopbacks on Vercel.`
+        );
+        return;
+      }
+    } else {
+      wsUrl = `ws://127.0.0.1:8000/ws/${channel}`;
+    }
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      socketRef.current = ws;
+
+      ws.onopen = () => {
+        setIsConnected(true);
+        reconnectAttemptRef.current = 0; // Reset backoff upon successful connection
+        console.log(`[WebSocket] Connected to channel "${channel}" via ${wsUrl}`);
+        // Initial ping
+        try {
+          ws.send(JSON.stringify({ type: 'PING' }));
+        } catch {}
+
+        // Setup active keep-alive heartbeat every 15s to keep proxy & mobile connections alive
+        clearPingInterval();
+        pingIntervalRef.current = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: 'PING' }));
+            } catch {}
+          }
+        }, 15000);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const parsed = JSON.parse(event.data);
+          if (parsed.type === 'PONG') return;
+
+          const wsEvent = parsed as WebSocketEvent;
+          setLastEvent(wsEvent);
+          console.log(`[WebSocket Event Received] ${wsEvent.event_type} on channel "${channel}"`, wsEvent.payload);
+          if (onEventRef.current) {
+            onEventRef.current(wsEvent);
+          }
+
+          // Debounced and coalesced query invalidations to prevent thundering herd / request spam
+          switch (wsEvent.event_type) {
+            case 'STATION_UPDATED':
+            case 'SESSION_UPDATED':
+            case 'SESSION_STARTED':
+            case 'SESSION_COMPLETED':
+            case 'SESSION_TRANSFERRED':
+            case 'SESSION_CANCELLED':
+            case 'STATION_LOCKED':
+              triggerDebouncedInvalidate([
+                'station-matrix',
+                'stations-live',
+                'fleet-categories',
+                'customer-sessions',
+                'kitchen-orders',
+                'admin-customers',
+                'desk-session',
+              ]);
+              break;
+
+            case 'BOOKING_CANCELLED':
+              if (wsEvent.payload) {
+                const bId = String(wsEvent.payload.booking_id || wsEvent.payload.id || '');
+                if (bId) {
+                  useLoungeStore.getState().cancelBooking(bId);
+                }
+              }
+              triggerDebouncedInvalidate([
+                'station-matrix',
+                'stations-live',
+                'customer-sessions',
+                'advance-bookings',
+              ]);
+              break;
+
+            case 'BOOKING_CREATED':
+            case 'BOOKING_UPDATED':
+              triggerDebouncedInvalidate([
+                'station-matrix',
+                'stations-live',
+                'customer-sessions',
+                'advance-bookings',
+              ]);
+              break;
+
+            case 'ORDER_STATUS_CHANGED':
+            case 'ORDER_DELETED':
+              if (wsEvent.payload) {
+                const lounge = useLoungeStore.getState();
+                const ordId = String(wsEvent.payload.order_id || wsEvent.payload.orderId || '');
+                const ordStatus = String(wsEvent.payload.status || '').toLowerCase();
+                const stName = wsEvent.payload.station_name || wsEvent.payload.stationId;
+
+                if (ordId) {
+                  if (wsEvent.event_type === 'ORDER_DELETED' || ordStatus === 'cancelled' || ordStatus === 'rejected') {
+                    lounge.removeInSeatOrder(ordId);
+                    if (stName) {
+                      lounge.clearStationFoodOrders(stName);
+                    }
+                  } else {
+                    lounge.updateInSeatOrderStatus(ordId, wsEvent.payload.status);
+                  }
+                }
+              }
+              triggerDebouncedInvalidate([
+                'station-matrix',
+                'kitchen-orders',
+                'stations-live',
+                'customer-sessions',
+                'desk-session',
+                'admin-menu',
+                'admin-customers',
+              ]);
+              break;
+
+            case 'ORDER_CREATED':
+              triggerDebouncedInvalidate([
+                'station-matrix',
+                'kitchen-orders',
+                'stations-live',
+                'customer-sessions',
+                'desk-session',
+                'admin-menu',
+                'admin-customers',
+              ]);
+              break;
+
+            case 'CUSTOMER_IN_SEAT_ORDER':
+              if (wsEvent.payload) {
+                const lounge = useLoungeStore.getState();
+                lounge.addInSeatOrder(wsEvent.payload as any);
+              }
+              triggerDebouncedInvalidate([
+                'station-matrix',
+                'kitchen-orders',
+                'stations-live',
+                'customer-sessions',
+                'desk-session',
+                'admin-menu',
+                'admin-customers',
+              ]);
+              break;
+
+            default:
+              triggerDebouncedInvalidate([
+                'station-matrix',
+                'stations-live',
+                'fleet-categories',
+                'customer-sessions',
+              ]);
+              break;
+          }
+        } catch {
+          // Non-JSON frame
+        }
+      };
+
+      ws.onclose = () => {
+        setIsConnected(false);
+        clearPingInterval();
+        if (isUnmountedRef.current) return;
+
+        // Exponential backoff with ±20% jitter to prevent thundering-herd on cold starts.
+        // Base delay: 1 s → 2 s → 4 s → … → 30 s ceiling.
+        const baseDelay = Math.min(30000, 1000 * Math.pow(2, reconnectAttemptRef.current));
+        const jitter = baseDelay * 0.2 * (Math.random() * 2 - 1); // ±20%
+        const delay = Math.max(500, Math.round(baseDelay + jitter));
+        reconnectAttemptRef.current += 1;
+
+        reconnectTimeoutRef.current = window.setTimeout(() => {
+          connect();
+        }, delay);
+      };
+
+      ws.onerror = () => {
+        clearPingInterval();
+        ws.close();
+      };
+    } catch {
+      clearPingInterval();
+      // Reconnect after 3s on immediate constructor failure
+      reconnectTimeoutRef.current = window.setTimeout(() => {
+        connect();
+      }, 3000);
+    }
+  }, [channel, queryClient]);
+
+  useEffect(() => {
+    isUnmountedRef.current = false;
+    connect();
+
+    return () => {
+      isUnmountedRef.current = true;
+      clearPingInterval();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+      if (socketRef.current) {
+        socketRef.current.close();
+      }
+    };
+  }, [connect]);
+
+  return { isConnected, lastEvent };
+}

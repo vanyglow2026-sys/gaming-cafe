@@ -1,0 +1,226 @@
+import secrets
+import uuid
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Header, status
+from sqlalchemy import select, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_db
+from app.core.config import settings
+from app.core.rate_limiter import RateLimiter
+from app.core.security import get_password_hash, verify_password, create_user_token, decode_jwt_token
+from app.models.entities import User
+from app.schemas.api_schemas import (
+    UserRegisterRequest,
+    UserLoginRequest,
+    UserResponse,
+    AuthTokenResponse,
+)
+
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+@router.post(
+    "/register",
+    response_model=AuthTokenResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(RateLimiter(max_requests=10, window_seconds=60, scope="auth_register"))],
+)
+async def register_customer(
+    payload: UserRegisterRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Registers a new gamer account with name, phone, and hashed password.
+    Enforces unique phone number constraint and honeypot spam protection.
+    """
+    if payload.website:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spam bot registration rejected.",
+        )
+
+    clean_phone = payload.phone.strip()
+    clean_name = payload.name.strip()
+
+    # Disallow registration under reserved administrator credentials
+    if (
+        secrets.compare_digest(clean_name.lower(), settings.ADMIN_USERNAME.lower())
+        or secrets.compare_digest(clean_phone, settings.ADMIN_PHONE)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reserved administrative username or phone number.",
+        )
+
+    # Check for existing user by phone
+    stmt = select(User).where(User.phone == clean_phone)
+    existing = (await db.execute(stmt)).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A player account with this phone number is already registered. Please log in.",
+        )
+
+    pw_hash = get_password_hash(payload.password)
+    new_user = User(
+        name=clean_name,
+        phone=clean_phone,
+        password_hash=pw_hash,
+        role="CUSTOMER",
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+
+    token = create_user_token(
+        user_id=str(new_user.id),
+        phone=new_user.phone,
+        role="customer",
+        name=new_user.name,
+    )
+    return AuthTokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(new_user),
+    )
+
+
+@router.post(
+    "/login",
+    response_model=AuthTokenResponse,
+    dependencies=[Depends(RateLimiter(max_requests=15, window_seconds=60, scope="auth_login"))],
+)
+async def login_user(
+    payload: UserLoginRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Authenticates either a customer (via phone or username) or administrator.
+    Returns a persistent Bearer JWT token.
+    """
+    identifier = payload.identifier.strip()
+    password = payload.password
+
+    # 1. Timing-safe Admin login check
+    is_admin_identifier = (
+        secrets.compare_digest(identifier.lower(), settings.ADMIN_USERNAME.lower())
+        or secrets.compare_digest(identifier, settings.ADMIN_PHONE)
+    )
+
+    if is_admin_identifier:
+        # Query admin user from DB
+        stmt = select(User).where(User.role == "ADMIN")
+        admin_user = (await db.execute(stmt)).scalar_one_or_none()
+
+        if not admin_user:
+            # Cold-start or test database fallback:
+            # Require password matching configured ADMIN_PASSWORD via timing-safe check
+            if not secrets.compare_digest(password, settings.ADMIN_PASSWORD):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid administrator credentials.",
+                )
+            try:
+                admin_user = User(
+                    name="System Administrator",
+                    phone=settings.ADMIN_PHONE,
+                    password_hash=get_password_hash(settings.ADMIN_PASSWORD),
+                    role="ADMIN",
+                )
+                db.add(admin_user)
+                await db.commit()
+                await db.refresh(admin_user)
+            except Exception:
+                await db.rollback()
+                stmt = select(User).where(User.role == "ADMIN")
+                admin_user = (await db.execute(stmt)).scalar_one_or_none()
+        else:
+            # Authenticate against stored hash
+            is_valid_pw = verify_password(password, admin_user.password_hash)
+            # If stored hash fails but password matches rotated ADMIN_PASSWORD in environment, auto-sync hash
+            if not is_valid_pw and secrets.compare_digest(password, settings.ADMIN_PASSWORD):
+                admin_user.password_hash = get_password_hash(settings.ADMIN_PASSWORD)
+                await db.commit()
+                await db.refresh(admin_user)
+                is_valid_pw = True
+
+            if not is_valid_pw:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid administrator credentials.",
+                )
+
+        token = create_user_token(
+            user_id=str(admin_user.id),
+            phone=admin_user.phone,
+            role="admin",
+            name=admin_user.name,
+        )
+        return AuthTokenResponse(
+            access_token=token,
+            token_type="bearer",
+            user=UserResponse.model_validate(admin_user),
+        )
+
+    # 2. Customer user check (by phone or name)
+    stmt = select(User).where(or_(User.phone == identifier, User.name == identifier))
+    user = (await db.execute(stmt)).scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account not found. Please register first or verify your phone number.",
+        )
+
+    if not verify_password(password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect password. Please try again.",
+        )
+
+    role_scope = "admin" if user.role == "ADMIN" else "customer"
+    token = create_user_token(
+        user_id=str(user.id),
+        phone=user.phone,
+        role=role_scope,
+        name=user.name,
+    )
+    return AuthTokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse.model_validate(user),
+    )
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user(
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetches the authenticated user profile using the Bearer token.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid token")
+
+    token = authorization.split(" ")[1]
+    try:
+        payload = decode_jwt_token(token)
+        user_id = payload.get("sub")
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    user = None
+    try:
+        user_uuid = uuid.UUID(user_id)
+        user = await db.get(User, user_uuid)
+    except (ValueError, TypeError):
+        stmt = select(User).where(or_(User.role == "ADMIN", User.phone == str(user_id), User.name == str(user_id)))
+        user = (await db.execute(stmt)).scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    return UserResponse.model_validate(user)
