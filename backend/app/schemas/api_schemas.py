@@ -131,6 +131,11 @@ class CheckoutRequest(BaseModel):
     payment_method: PaymentMethod
     discount_percent: Optional[Decimal] = None
     discount_amount: Optional[Decimal] = None
+    advance_paid: Optional[Decimal] = None
+
+
+class SessionAdvanceUpdateRequest(BaseModel):
+    advance_paid: Decimal = Field(default=Decimal("0.00"), ge=0)
 
 
 class SessionResponse(BaseModel):

@@ -315,7 +315,8 @@ export async function checkoutSession(
   sessionId: string,
   paymentMethod: 'CASH' | 'UPI',
   discountPercent: number = 0,
-  discountAmount?: number
+  discountAmount?: number,
+  advancePaid?: number
 ): Promise<CheckoutResult> {
   const idempotencyKey = `chk-${sessionId}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   const res = await safeFetch(`${API_BASE}/admin/sessions/checkout`, {
@@ -329,9 +330,26 @@ export async function checkoutSession(
       payment_method: paymentMethod,
       discount_percent: discountPercent,
       ...(discountAmount !== undefined && discountAmount > 0 ? { discount_amount: discountAmount } : {}),
+      ...(advancePaid !== undefined ? { advance_paid: advancePaid } : {}),
     }),
   });
   return handleResponse<CheckoutResult>(res);
+}
+
+export async function updateSessionAdvance(
+  sessionId: string,
+  advancePaid: number
+): Promise<{ session_id: string; advance_paid: number; message: string }> {
+  const res = await safeFetch(`${API_BASE}/admin/sessions/${sessionId}/advance`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      advance_paid: advancePaid,
+    }),
+  });
+  return handleResponse(res);
 }
 
 export async function fetchKitchenOrders(): Promise<Order[]> {

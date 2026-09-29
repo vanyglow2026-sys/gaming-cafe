@@ -1,4 +1,4 @@
-import React, { useState, useId, useMemo } from 'react';
+import React, { useState, useId, useMemo, useEffect } from 'react';
 import {
   Receipt,
   XCircle,
@@ -82,6 +82,13 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
   const [discountInput, setDiscountInput] = useState<string>('');
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('CASH');
   const [touchedDiscount, setTouchedDiscount] = useState<boolean>(false);
+  const [advanceInput, setAdvanceInput] = useState<string>(
+    advancePaid !== undefined && Number(advancePaid) > 0 ? String(advancePaid) : ''
+  );
+
+  useEffect(() => {
+    setAdvanceInput(advancePaid !== undefined && Number(advancePaid) > 0 ? String(advancePaid) : '');
+  }, [advancePaid]);
 
   // Derived Food & Beverage total from itemized list, fallback to ordersCharge prop if list is empty
   const computedOrdersTotal = useMemo(() => {
@@ -107,13 +114,16 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
   // Safe effective discount amount
   const effectiveDiscountAmount = isDiscountInvalid ? 0 : rawDiscountAmount;
 
-  // Total after discount deduction
+  // Total after discount deduction (Grand Total before advance deduction)
   const totalAfterDiscount = Math.max(0, subTotal - effectiveDiscountAmount);
 
-  // Advance paid upfront deduction
-  const safeAdvancePaid = Math.max(0, Number(advancePaid) || 0);
+  // Advance paid deduction
+  const parsedAdvance = parseFloat(advanceInput);
+  const safeAdvancePaid = Number.isFinite(parsedAdvance) && parsedAdvance >= 0
+    ? parsedAdvance
+    : (advanceInput === '' ? 0 : Math.max(0, Number(advancePaid) || 0));
 
-  // Final amount to settle / balance due
+  // Final amount to settle / balance due = Total After Discount - Advance Paid
   const balanceDue = Math.max(0, totalAfterDiscount - safeAdvancePaid);
   const grandTotal = balanceDue;
 
@@ -374,42 +384,42 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
               </div>
             )}
 
-            {/* Total After Discount (if advance paid or discount was present) */}
-            {(effectiveDiscountAmount > 0 || safeAdvancePaid > 0) && (
-              <div className="flex justify-between items-center text-xs text-[#64748B] pt-1">
-                <span>Total Bill Amount:</span>
-                <span className="font-mono-code font-bold text-[#0F172A]">
-                  ₹{totalAfterDiscount.toFixed(2)}
-                </span>
-              </div>
-            )}
+            {/* Grand Total / Total Bill Amount line */}
+            <div className="flex justify-between items-center text-xs text-[#64748B] pt-1 border-t border-[#E2E8F0]">
+              <span className="font-semibold text-[#0F172A]">Grand Total:</span>
+              <span className="font-mono-code font-bold text-[#0F172A]">
+                ₹{totalAfterDiscount.toFixed(2)}
+              </span>
+            </div>
 
-            {/* Advance Money Paid Upfront Line */}
-            {safeAdvancePaid > 0 && (
-              <div className="flex justify-between items-center text-[#1E40AF] bg-[#EFF6FF] border border-[#BFDBFE] px-2.5 py-1.5 rounded-xl font-medium">
-                <span className="flex items-center gap-1.5 text-xs font-semibold">
-                  <Banknote className="w-3.5 h-3.5" />
-                  <span>Advance Money Paid:</span>
+            {/* Advance Money Paid Upfront Line - ALWAYS kept inside this breakdown */}
+            <div className={`flex justify-between items-center px-2.5 py-1.5 rounded-xl font-medium ${
+              safeAdvancePaid > 0
+                ? 'text-[#1E40AF] bg-[#EFF6FF] border border-[#BFDBFE]'
+                : 'text-[#64748B] bg-[#FFFFFF] border border-[#E2E8F0]'
+            }`}>
+              <span className="flex items-center gap-1.5 text-xs font-semibold">
+                <Banknote className="w-3.5 h-3.5 text-[#2563EB]" />
+                <span>Advance Amount Paid:</span>
+                {safeAdvancePaid > 0 && (
                   <span className="text-[10px] font-mono-code font-bold uppercase text-[#1D4ED8] bg-[#DBEAFE] px-1.5 py-0.5 rounded">
-                    Already Paid Upfront
+                    Paid Upfront
                   </span>
-                </span>
-                <span className="font-bold text-sm font-mono-code">
-                  - ₹{safeAdvancePaid.toFixed(2)}
-                </span>
-              </div>
-            )}
+                )}
+              </span>
+              <span className="font-bold text-sm font-mono-code">
+                {safeAdvancePaid > 0 ? `- ₹${safeAdvancePaid.toFixed(2)}` : '₹0.00'}
+              </span>
+            </div>
 
-            {/* Prominent Final Amount Due */}
+            {/* Prominent Final Amount Due = Grand Total - Advance Paid */}
             <div className="flex justify-between items-center pt-2.5 border-t border-[#E2E8F0] text-[#0F172A]">
               <div>
                 <span className="text-xs uppercase tracking-wider text-[#172554] font-black block">
-                  Final Amount to Settle
+                  Final Amount / Balance Due
                 </span>
                 <span className="text-[10px] text-[#64748B]">
-                  {safeAdvancePaid > 0
-                    ? `Total (₹${totalAfterDiscount.toFixed(2)}) - Advance Paid (₹${safeAdvancePaid.toFixed(2)})`
-                    : 'Includes all charges & discounts'}
+                  Grand Total (₹{totalAfterDiscount.toFixed(2)}) - Advance Paid (₹{safeAdvancePaid.toFixed(2)})
                 </span>
               </div>
               <div className="text-right">
@@ -505,6 +515,48 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
                 </span>
               </p>
             )}
+          </div>
+
+          {/* Advance Money Paid Input Section */}
+          <div className="p-3.5 bg-[#EFF6FF] rounded-2xl border border-[#BFDBFE] space-y-2">
+            <div className="flex items-center justify-between">
+              <label
+                htmlFor="settle-advance-input"
+                className="font-semibold text-[#1E40AF] flex items-center gap-1.5 text-xs"
+              >
+                <Banknote className="w-3.5 h-3.5 text-[#2563EB]" />
+                <span>Advance Amount Paid (₹):</span>
+              </label>
+              {safeAdvancePaid > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setAdvanceInput('')}
+                  className="text-[10px] text-[#2563EB] hover:text-[#1D4ED8] underline cursor-pointer"
+                >
+                  Clear advance
+                </button>
+              )}
+            </div>
+
+            {/* Rupee Input Group */}
+            <div className="relative flex items-center">
+              <span className="absolute left-3 font-mono-code font-bold text-[#64748B] select-none text-sm">
+                ₹
+              </span>
+              <input
+                id="settle-advance-input"
+                type="number"
+                min="0"
+                step="1"
+                value={advanceInput}
+                onChange={(e) => setAdvanceInput(e.target.value)}
+                placeholder="0.00"
+                className="w-full pl-8 pr-28 py-2.5 rounded-xl bg-[#FFFFFF] border border-[#BFDBFE] font-mono-code text-sm font-bold text-[#0F172A] placeholder-[#94A3B8] focus:outline-none focus:border-[#2563EB] focus:ring-2 focus:ring-[#2563EB]/20 transition-all"
+              />
+              <span className="absolute right-3 text-[11px] text-[#2563EB] uppercase font-bold">
+                Advance Paid
+              </span>
+            </div>
           </div>
 
           {/* Payment Method Selector */}

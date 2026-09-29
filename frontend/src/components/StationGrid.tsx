@@ -211,12 +211,13 @@ export const StationGrid: React.FC = () => {
       let apiRes: any = null;
       if (targetSessionId && !targetSessionId.startsWith('cafe-walkin')) {
         try {
-          // Call backend with payment method, discount percent, and flat discount amount
+          // Call backend with payment method, discount percent, flat discount amount, and advance paid
           apiRes = await checkoutSession(
             targetSessionId,
             payload.paymentMethod,
             payload.discountPercent,
-            payload.discountAmount
+            payload.discountAmount,
+            payload.advancePaid
           );
         } catch (checkoutErr: any) {
           const errText = String(checkoutErr?.message || '').toLowerCase();
@@ -338,8 +339,16 @@ export const StationGrid: React.FC = () => {
       matched
         ? {
             ...matched,
+            time_charge: session.time_charge !== undefined ? session.time_charge : matched.time_charge,
+            orders_charge: session.orders_charge !== undefined ? session.orders_charge : matched.orders_charge,
+            running_total: session.running_total !== undefined ? session.running_total : matched.running_total,
             advance_paid: session.advance_paid !== undefined ? session.advance_paid : (matched as any).advance_paid || 0,
             balance_due: session.balance_due !== undefined ? session.balance_due : (matched as any).balance_due || 0,
+            elapsed_minutes: session.elapsed_minutes !== undefined ? session.elapsed_minutes : matched.elapsed_minutes,
+            remaining_minutes: session.remaining_minutes !== undefined ? session.remaining_minutes : matched.remaining_minutes,
+            active_session_id: session.session_id || matched.active_session_id,
+            customer_name: session.customer_name || matched.customer_name,
+            customer_phone: session.customer_phone || matched.customer_phone,
           }
         : ({
             id: session.station_id || session.session_id,

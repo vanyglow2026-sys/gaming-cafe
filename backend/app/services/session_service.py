@@ -540,6 +540,7 @@ async def settle_checkout(
     idempotency_key: str,
     discount_percent: Optional[Decimal] = None,
     discount_amount: Optional[Decimal] = None,
+    advance_paid: Optional[Decimal] = None,
 ) -> Dict[str, Any]:
     """
     Checkout handler:
@@ -636,8 +637,11 @@ async def settle_checkout(
     else:
         total_amount = raw_subtotal
 
-    advance_paid = cafe_session.advance_paid or Decimal("0.00")
-    balance_due = max(Decimal("0.00"), (total_amount - advance_paid).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP))
+    if advance_paid is not None:
+        cafe_session.advance_paid = max(Decimal("0.00"), Decimal(str(advance_paid)).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP))
+
+    advance_paid_final = cafe_session.advance_paid or Decimal("0.00")
+    balance_due = max(Decimal("0.00"), (total_amount - advance_paid_final).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP))
 
     # 5. Check if payment already exists for this idempotency_key
     existing_payment_stmt = select(Payment).where(Payment.idempotency_key == idempotency_key)
@@ -703,7 +707,7 @@ async def settle_checkout(
             "station_id": str(station.id),
             "station_name": station.name,
             "total_amount": str(total_amount),
-            "advance_paid": str(advance_paid),
+            "advance_paid": str(advance_paid_final),
             "balance_due": str(balance_due),
             "payment_method": payment_method,
         },
@@ -715,7 +719,7 @@ async def settle_checkout(
         payload={
             "session_id": str(cafe_session.id),
             "total_amount": str(total_amount),
-            "advance_paid": str(advance_paid),
+            "advance_paid": str(advance_paid_final),
             "balance_due": str(balance_due),
             "station_charge": str(station_charge),
             "orders_charge": str(orders_charge),
@@ -740,7 +744,7 @@ async def settle_checkout(
         "station_charge": station_charge,
         "orders_charge": orders_charge,
         "total_amount": total_amount,
-        "advance_paid": advance_paid,
+        "advance_paid": advance_paid_final,
         "balance_due": balance_due,
         "payment_method": payment_method,
         "payment_status": payment.status,

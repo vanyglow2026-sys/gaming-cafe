@@ -38,6 +38,7 @@ from app.schemas.api_schemas import (
     SessionResponse,
     StationMatrixResponse,
     SessionExtendRequest,
+    SessionAdvanceUpdateRequest,
 )
 from app.services.order_service import serialize_order, ensure_utc, CURRENCY_QUANTIZATION, sum_order_charges
 from app.services.session_service import (
@@ -547,8 +548,34 @@ async def admin_checkout(
         idempotency_key=resolved_idempotency_key,
         discount_percent=payload.discount_percent,
         discount_amount=payload.discount_amount,
+        advance_paid=payload.advance_paid,
     )
     return CheckoutResponse(**result)
+
+
+@router.patch("/sessions/{session_id}/advance")
+async def update_session_advance(
+    session_id: uuid.UUID,
+    payload: SessionAdvanceUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update advance money paid on an active session.
+    """
+    stmt = select(Session).where(Session.id == session_id)
+    session = (await db.execute(stmt)).scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    adv_decimal = max(Decimal("0.00"), Decimal(str(payload.advance_paid)).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP))
+    session.advance_paid = adv_decimal
+    await db.commit()
+    await db.refresh(session)
+    return {
+        "session_id": str(session.id),
+        "advance_paid": float(session.advance_paid),
+        "message": "Advance payment updated successfully",
+    }
 
 
 @router.get("/kitchen/orders", response_model=List[OrderResponse])
@@ -1393,7 +1420,10 @@ async def get_revenue_analytics(
 
     stmt = (
         select(Session)
-        .where(Session.started_at >= cutoff)
+        .where(
+            Session.status == SessionStatus.COMPLETED.value,
+            func.coalesce(Session.ended_at, Session.started_at) >= cutoff,
+        )
         .options(
             selectinload(Session.orders).selectinload(Order.items).selectinload(OrderItem.menu_item),
             selectinload(Session.payments),
@@ -1423,41 +1453,47 @@ async def get_revenue_analytics(
     )
 
     for s in sessions:
-        started_at = ensure_utc(s.started_at)
-        day_key = started_at.strftime("%Y-%m-%d")
+        # Strictly settled/completed sessions only
+        settled_at = ensure_utc(s.ended_at or s.started_at)
+        day_key = settled_at.strftime("%Y-%m-%d")
 
         s_total = s.total_amount if (s.total_amount is not None and s.total_amount > Decimal("0.00")) else Decimal("0.00")
+
+        # Aggregate food orders completed/served for this settled session
         s_food_charge = Decimal("0.00")
         for o in s.orders:
-            if o.status not in (OrderStatus.CANCELLED.value, "REJECTED", "rejected"):
+            if o.status in (OrderStatus.SERVED.value, "SERVED", "served"):
                 for itm in o.items:
-                    s_food_charge += (itm.unit_price * Decimal(str(itm.quantity))).quantize(
-                        CURRENCY_QUANTIZATION
-                    )
+                    qty = Decimal(str(itm.quantity))
+                    u_price = itm.unit_price or Decimal("0.00")
+                    s_food_charge += (u_price * qty).quantize(CURRENCY_QUANTIZATION)
                     name = itm.menu_item.name if itm.menu_item else "Item"
                     item_counts[name] += itm.quantity
 
-        if s.status == SessionStatus.COMPLETED.value:
-            if s_total > Decimal("0.00"):
-                s_time_charge = max(Decimal("0.00"), s_total - s_food_charge)
-            else:
-                s_time_charge = Decimal("0.00")
-                s_total = s_time_charge + s_food_charge
+        is_cafe = bool(
+            (s.station_name and "CAFE" in s.station_name.upper()) or
+            (s.tier and "CAFE" in str(s.tier).upper())
+        )
+
+        if is_cafe:
+            s_time_charge = Decimal("0.00")
+            s_food_charge = s_total
         else:
-            s_time_charge = s.tier_price or Decimal("0.00")
-            s_total = s_time_charge + s_food_charge
+            s_food_charge = min(s_food_charge, s_total)
+            s_time_charge = max(Decimal("0.00"), s_total - s_food_charge)
 
         gaming_revenue += s_time_charge
         food_revenue += s_food_charge
         total_revenue += s_total
 
         # Reconcile Payment Method attribution (Cash vs UPI/QR)
-        s_cash = Decimal("0.00")
-        s_upi = Decimal("0.00")
         completed_payments = [
             p for p in (s.payments or [])
             if getattr(p, "status", None) in (PaymentStatus.COMPLETED.value, "COMPLETED")
         ]
+
+        s_cash = Decimal("0.00")
+        s_upi = Decimal("0.00")
 
         if completed_payments:
             p_cash = sum(
@@ -1473,13 +1509,17 @@ async def get_revenue_analytics(
                 s_cash = (s_total * (p_cash / paid_sum)).quantize(CURRENCY_QUANTIZATION)
                 s_upi = s_total - s_cash
             else:
-                s_cash = s_total
+                first_meth = (completed_payments[0].method or "").upper()
+                if "UPI" in first_meth:
+                    s_upi = s_total
+                else:
+                    s_cash = s_total
 
             cash_items = len([p for p in completed_payments if "CASH" in (p.method or "").upper()])
             upi_items = len([p for p in completed_payments if "UPI" in (p.method or "").upper()])
             cash_count += cash_items
             upi_count += upi_items
-        elif s.status == SessionStatus.COMPLETED.value and s_total > Decimal("0.00"):
+        elif s_total > Decimal("0.00"):
             # Default to Cash for completed sessions without explicit payment rows
             s_cash = s_total
             cash_count += 1
