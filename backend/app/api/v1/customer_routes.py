@@ -611,6 +611,8 @@ async def get_customer_sessions(
             "timeCharge": time_charge,
             "ordersCharge": orders_charge,
             "totalCost": total_cost,
+            "advancePaid": float(s.advance_paid or 0.0),
+            "balanceDue": max(0.0, round(total_cost - float(s.advance_paid or 0.0), 2)),
         })
     return out
 

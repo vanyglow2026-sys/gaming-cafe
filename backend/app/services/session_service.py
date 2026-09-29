@@ -69,23 +69,24 @@ def _compute_time_charge(
 ) -> Decimal:
     """Calculate the current time-based charge for an active session.
 
-    * Within allocation: return locked-in ``tier_price``.
-    * Over allocation: tier_price + prorated overtime at ``hourly_rate``.
-    * No tier_price: use the billing-engine minute-accurate formula.
+    * When session duration ends, timer stops and extra charges are NOT automatically
+      added for overtime unless admin explicitly extends the session.
+    * Tier price is locked in for the allocated duration and updated only on extension.
+    * If allocated_minutes == 0 (open-ended/food only) without tier price: 0.00.
+    * If tier price is not set but allocated_minutes > 0: capped at allocated duration.
     """
     if allocated_minutes == 0 and (tier_price is None or tier_price == Decimal("0.00")):
         return Decimal("0.00")
     if tier_price is not None and tier_price > Decimal("0.00"):
-        if elapsed_minutes > allocated_minutes:
-            overtime_min = elapsed_minutes - allocated_minutes
-            overtime = (
-                (Decimal(str(overtime_min)) / Decimal("60")) * hourly_rate
-            ).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP)
-            return (tier_price + overtime).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP)
         return tier_price
 
     if hourly_rate == Decimal("0.00"):
         return Decimal("0.00")
+
+    if allocated_minutes > 0:
+        capped_end = started_at + timedelta(minutes=allocated_minutes)
+        effective_reference = min(reference_time, capped_end)
+        return calculate_station_charge(started_at, effective_reference, hourly_rate)
 
     return calculate_station_charge(started_at, reference_time, hourly_rate)
 
@@ -635,6 +636,9 @@ async def settle_checkout(
     else:
         total_amount = raw_subtotal
 
+    advance_paid = cafe_session.advance_paid or Decimal("0.00")
+    balance_due = max(Decimal("0.00"), (total_amount - advance_paid).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP))
+
     # 5. Check if payment already exists for this idempotency_key
     existing_payment_stmt = select(Payment).where(Payment.idempotency_key == idempotency_key)
     existing_payment = (await db.execute(existing_payment_stmt)).scalar_one_or_none()
@@ -647,7 +651,7 @@ async def settle_checkout(
         )
         payment = Payment(
             session_id=cafe_session.id,
-            amount=total_amount,
+            amount=balance_due,
             method=payment_method_str,
             status=PaymentStatus.COMPLETED.value,
             idempotency_key=idempotency_key,
@@ -678,13 +682,13 @@ async def settle_checkout(
     if not other_st_sess.scalars().first():
         station.status = StationStatus.AVAILABLE.value
 
-    # 7. Generate UPI QR string if UPI
+    # 7. Generate UPI QR string if UPI (for remaining balance due)
     upi_qr_string = None
-    if payment_method == "UPI":
+    if payment_method == "UPI" and balance_due > Decimal("0.00"):
         upi_qr_string = generate_upi_qr_string(
             merchant_vpa=settings.UPI_MERCHANT_VPA,
             merchant_name=settings.UPI_MERCHANT_NAME,
-            amount=total_amount,
+            amount=balance_due,
             session_id=cafe_session.id,
         )
 
@@ -699,6 +703,8 @@ async def settle_checkout(
             "station_id": str(station.id),
             "station_name": station.name,
             "total_amount": str(total_amount),
+            "advance_paid": str(advance_paid),
+            "balance_due": str(balance_due),
             "payment_method": payment_method,
         },
     )
@@ -709,6 +715,8 @@ async def settle_checkout(
         payload={
             "session_id": str(cafe_session.id),
             "total_amount": str(total_amount),
+            "advance_paid": str(advance_paid),
+            "balance_due": str(balance_due),
             "station_charge": str(station_charge),
             "orders_charge": str(orders_charge),
         },
@@ -732,6 +740,8 @@ async def settle_checkout(
         "station_charge": station_charge,
         "orders_charge": orders_charge,
         "total_amount": total_amount,
+        "advance_paid": advance_paid,
+        "balance_due": balance_due,
         "payment_method": payment_method,
         "payment_status": payment.status,
         "upi_qr_string": upi_qr_string,
@@ -1210,6 +1220,8 @@ async def get_fleet_matrix(db: AsyncSession) -> Dict[str, Any]:
                 "time_charge": time_charge,
                 "orders_charge": orders_charge,
                 "running_total": running_total,
+                "advance_paid": active_s.advance_paid or Decimal("0.00"),
+                "balance_due": max(Decimal("0.00"), running_total - (active_s.advance_paid or Decimal("0.00"))),
                 "active_orders_count": active_orders_count,
                 "hourly_rate": Decimal("0.00") if is_food_only else st_rate,
                 "pricing_tiers": pricing_tiers,
@@ -1302,6 +1314,8 @@ async def get_fleet_matrix(db: AsyncSession) -> Dict[str, Any]:
             "time_charge": vr_time_charge,
             "orders_charge": vr_orders_charge,
             "running_total": vr_running_total,
+            "advance_paid": vr_active_s.advance_paid or Decimal("0.00"),
+            "balance_due": max(Decimal("0.00"), vr_running_total - (vr_active_s.advance_paid or Decimal("0.00"))),
             "active_orders_count": vr_active_orders_count,
             "hourly_rate": Decimal("0.00") if is_vr_food_only else vr_rate,
             "pricing_tiers": vr_pricing_tiers,
@@ -1339,6 +1353,8 @@ async def get_fleet_matrix(db: AsyncSession) -> Dict[str, Any]:
             "time_charge": Decimal("0.00"),
             "orders_charge": cafe_orders_charge,
             "running_total": cafe_orders_charge,
+            "advance_paid": cafe_s.advance_paid or Decimal("0.00"),
+            "balance_due": max(Decimal("0.00"), cafe_orders_charge - (cafe_s.advance_paid or Decimal("0.00"))),
             "active_orders_count": cafe_active_orders_count,
             "hourly_rate": Decimal("0.00"),
             "pricing_tiers": [],
@@ -1364,6 +1380,7 @@ async def start_category_session(
     customer_phone: Optional[str] = None,
     user_id: Optional[uuid.UUID] = None,
     tier_price: Optional[Decimal] = None,
+    advance_paid: Optional[Decimal] = None,
 ) -> Session:
     """
     Enforces shared-resource device allocation and atomic conflict rejection.
@@ -1570,6 +1587,8 @@ async def start_category_session(
         if existing_u:
             valid_user_uuid = existing_u.id
 
+    adv_decimal = Decimal(str(advance_paid or 0)).quantize(CURRENCY_QUANTIZATION, rounding=ROUND_HALF_UP)
+
     if active_conflict and is_food_only:
         # Customer arrived at their seat where food was ordered!
         # Upgrade zero-charge food-only session to active gaming session
@@ -1588,6 +1607,7 @@ async def start_category_session(
         active_conflict.allocated_minutes = duration_minutes
         active_conflict.tier_price = resolved_tier_price
         active_conflict.total_amount = resolved_tier_price
+        active_conflict.advance_paid = adv_decimal
         active_conflict.category_id = norm_cat
         new_session = active_conflict
     else:
@@ -1602,11 +1622,23 @@ async def start_category_session(
             started_at=datetime.now(timezone.utc),
             status=SessionStatus.ACTIVE.value,
             total_amount=resolved_tier_price,
+            advance_paid=adv_decimal,
             allocated_minutes=duration_minutes,
             tier_price=resolved_tier_price,
             category_id=norm_cat,
         )
         db.add(new_session)
+        await db.flush()
+
+    if adv_decimal > Decimal("0.00"):
+        adv_payment = Payment(
+            session_id=new_session.id,
+            amount=adv_decimal,
+            method=PaymentMethod.CASH.value,
+            status=PaymentStatus.COMPLETED.value,
+            idempotency_key=f"adv-{new_session.id}-{int(datetime.now().timestamp())}",
+        )
+        db.add(adv_payment)
         await db.flush()
 
     # Transition PhysicalDevice to OCCUPIED if present
@@ -1634,6 +1666,7 @@ async def start_category_session(
             "status": StationStatus.OCCUPIED.value,
             "customer_name": new_session.customer_name,
             "tier_price": str(resolved_tier_price),
+            "advance_paid": str(adv_decimal),
             "allocated_minutes": duration_minutes,
         },
     )

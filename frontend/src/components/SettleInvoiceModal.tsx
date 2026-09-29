@@ -27,6 +27,9 @@ export interface SettleInvoicePayload {
   subTotal: number;
   discountAmount: number;
   discountPercent: number;
+  totalAfterDiscount?: number;
+  advancePaid?: number;
+  balanceDue?: number;
   grandTotal: number;
   paymentMethod: PaymentMethod;
   orderedItems: OrderedReceiptItem[];
@@ -40,6 +43,7 @@ export interface SettleInvoiceModalProps {
   customerName?: string | null;
   customerPhone?: string | null;
   timeCharge: number;
+  advancePaid?: number;
   elapsedMinutes?: number;
   allocatedMinutes?: number;
   orderedItems?: OrderedReceiptItem[];
@@ -57,6 +61,7 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
   customerName,
   customerPhone,
   timeCharge = 0,
+  advancePaid = 0,
   elapsedMinutes,
   allocatedMinutes,
   orderedItems = [],
@@ -102,8 +107,15 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
   // Safe effective discount amount
   const effectiveDiscountAmount = isDiscountInvalid ? 0 : rawDiscountAmount;
 
-  // Grand total calculation: dynamically updates in real time
-  const grandTotal = Math.max(0, subTotal - effectiveDiscountAmount);
+  // Total after discount deduction
+  const totalAfterDiscount = Math.max(0, subTotal - effectiveDiscountAmount);
+
+  // Advance paid upfront deduction
+  const safeAdvancePaid = Math.max(0, Number(advancePaid) || 0);
+
+  // Final amount to settle / balance due
+  const balanceDue = Math.max(0, totalAfterDiscount - safeAdvancePaid);
+  const grandTotal = balanceDue;
 
   // Equivalent percentage for display or backend compatibility
   const discountPercent = subTotal > 0 ? (effectiveDiscountAmount / subTotal) * 100 : 0;
@@ -142,6 +154,9 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
       subTotal: Number(subTotal.toFixed(2)),
       discountAmount: Number(effectiveDiscountAmount.toFixed(2)),
       discountPercent: Number(discountPercent.toFixed(2)),
+      totalAfterDiscount: Number(totalAfterDiscount.toFixed(2)),
+      advancePaid: Number(safeAdvancePaid.toFixed(2)),
+      balanceDue: Number(balanceDue.toFixed(2)),
       grandTotal: Number(grandTotal.toFixed(2)),
       paymentMethod,
       orderedItems,
@@ -359,17 +374,47 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
               </div>
             )}
 
-            {/* Prominent Grand Total Due */}
+            {/* Total After Discount (if advance paid or discount was present) */}
+            {(effectiveDiscountAmount > 0 || safeAdvancePaid > 0) && (
+              <div className="flex justify-between items-center text-xs text-[#64748B] pt-1">
+                <span>Total Bill Amount:</span>
+                <span className="font-mono-code font-bold text-[#0F172A]">
+                  ₹{totalAfterDiscount.toFixed(2)}
+                </span>
+              </div>
+            )}
+
+            {/* Advance Money Paid Upfront Line */}
+            {safeAdvancePaid > 0 && (
+              <div className="flex justify-between items-center text-[#1E40AF] bg-[#EFF6FF] border border-[#BFDBFE] px-2.5 py-1.5 rounded-xl font-medium">
+                <span className="flex items-center gap-1.5 text-xs font-semibold">
+                  <Banknote className="w-3.5 h-3.5" />
+                  <span>Advance Money Paid:</span>
+                  <span className="text-[10px] font-mono-code font-bold uppercase text-[#1D4ED8] bg-[#DBEAFE] px-1.5 py-0.5 rounded">
+                    Already Paid Upfront
+                  </span>
+                </span>
+                <span className="font-bold text-sm font-mono-code">
+                  - ₹{safeAdvancePaid.toFixed(2)}
+                </span>
+              </div>
+            )}
+
+            {/* Prominent Final Amount Due */}
             <div className="flex justify-between items-center pt-2.5 border-t border-[#E2E8F0] text-[#0F172A]">
               <div>
-                <span className="text-xs uppercase tracking-wider text-[#172554] font-bold block">
-                  Grand Total Due
+                <span className="text-xs uppercase tracking-wider text-[#172554] font-black block">
+                  Final Amount to Settle
                 </span>
-                <span className="text-[10px] text-[#64748B]">Includes all charges &amp; discounts</span>
+                <span className="text-[10px] text-[#64748B]">
+                  {safeAdvancePaid > 0
+                    ? `Total (₹${totalAfterDiscount.toFixed(2)}) - Advance Paid (₹${safeAdvancePaid.toFixed(2)})`
+                    : 'Includes all charges & discounts'}
+                </span>
               </div>
               <div className="text-right">
                 <span className="font-mono-code text-xl sm:text-2xl font-black text-[#172554] tracking-tight">
-                  ₹{grandTotal.toFixed(2)}
+                  ₹{balanceDue.toFixed(2)}
                 </span>
               </div>
             </div>
@@ -531,8 +576,10 @@ export const SettleInvoiceModal: React.FC<SettleInvoiceModalProps> = ({
                 <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin mr-1" />
                 <span>Processing...</span>
               </>
+            ) : balanceDue > 0 ? (
+              <span>SETTLE BALANCE (₹{balanceDue.toFixed(2)})</span>
             ) : (
-              <span>SETTLE INVOICE (₹{grandTotal.toFixed(2)})</span>
+              <span>SETTLE INVOICE (FULLY PAID)</span>
             )}
           </button>
         </div>

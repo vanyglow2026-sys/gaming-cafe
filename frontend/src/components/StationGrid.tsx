@@ -273,7 +273,7 @@ export const StationGrid: React.FC = () => {
       ]);
 
       const settledStationName = checkoutStationTarget.name;
-      const settledAmount = (apiRes?.total_amount !== undefined ? Number(apiRes.total_amount) : payload.grandTotal).toFixed(2);
+      const settledAmount = (apiRes?.balance_due !== undefined ? Number(apiRes.balance_due) : payload.grandTotal).toFixed(2);
       setCheckoutStationTarget(null);
       addNotification(
         'SYSTEM',
@@ -335,23 +335,31 @@ export const StationGrid: React.FC = () => {
         )
       : null;
     setCheckoutStationTarget(
-      matched || ({
-        id: session.station_id || session.session_id,
-        name: stationName,
-        tier: (isCafe ? 'CAFE' : 'CONSOLE') as any,
-        hourly_rate: session.hourly_rate || 0,
-        status: 'OCCUPIED',
-        is_occupied: true,
-        active_session_id: session.session_id,
-        time_charge: session.time_charge || 0,
-        orders_charge: session.orders_charge,
-        running_total: session.running_total,
-        elapsed_minutes: session.elapsed_minutes || 0,
-        remaining_minutes: session.remaining_minutes || 0,
-        active_orders_count: session.active_orders_count || 0,
-        customer_name: session.customer_name,
-        customer_phone: session.customer_phone,
-      } as StationLive)
+      matched
+        ? {
+            ...matched,
+            advance_paid: session.advance_paid !== undefined ? session.advance_paid : (matched as any).advance_paid || 0,
+            balance_due: session.balance_due !== undefined ? session.balance_due : (matched as any).balance_due || 0,
+          }
+        : ({
+            id: session.station_id || session.session_id,
+            name: stationName,
+            tier: (isCafe ? 'CAFE' : 'CONSOLE') as any,
+            hourly_rate: session.hourly_rate || 0,
+            status: 'OCCUPIED',
+            is_occupied: true,
+            active_session_id: session.session_id,
+            time_charge: session.time_charge || 0,
+            orders_charge: session.orders_charge,
+            running_total: session.running_total,
+            advance_paid: session.advance_paid || 0,
+            balance_due: session.balance_due || 0,
+            elapsed_minutes: session.elapsed_minutes || 0,
+            remaining_minutes: session.remaining_minutes || 0,
+            active_orders_count: session.active_orders_count || 0,
+            customer_name: session.customer_name,
+            customer_phone: session.customer_phone,
+          } as StationLive)
     );
   };
 
@@ -794,6 +802,7 @@ export const StationGrid: React.FC = () => {
           customerName={checkoutStationTarget.customer_name}
           customerPhone={checkoutStationTarget.customer_phone}
           timeCharge={Number(checkoutStationTarget.time_charge || 0)}
+          advancePaid={Number(checkoutStationTarget.advance_paid || 0)}
           ordersCharge={Number(checkoutStationTarget.orders_charge || 0)}
           elapsedMinutes={checkoutStationTarget.elapsed_minutes}
           allocatedMinutes={

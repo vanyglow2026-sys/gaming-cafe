@@ -23,6 +23,7 @@ import {
   ChevronUp,
   Phone,
   AlertTriangle,
+  AlertCircle,
   CalendarClock,
   XCircle,
   Coffee,
@@ -97,6 +98,10 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
   const [customerNames, setCustomerNames] = useState<Record<string, string>>({});
   // Optional customer phone per cell: map key `${modeId}-${stationId}` -> phone
   const [customerPhones, setCustomerPhones] = useState<Record<string, string>>({});
+  // Optional advance money / paid per cell: map key `${modeId}-${stationId}` -> advance amount
+  const [advancePaidAmounts, setAdvancePaidAmounts] = useState<Record<string, string>>({});
+  // Track sessions that have already beeped on timer completion to avoid repetitive beeping
+  const beepedSessionsRef = useRef<Set<string>>(new Set());
   // Starting session loading state: `${modeId}-${stationId}`
   const [initiatingCell, setInitiatingCell] = useState<string | null>(null);
   // Extending session loading state: sessionId
@@ -209,6 +214,43 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
     return () => clearInterval(timer);
   }, []);
 
+  // Web Audio API session beep chime
+  const playSessionBeep = () => {
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const ctx = new AudioContextClass();
+
+      const playTone = (freq: number, start: number, duration: number) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+
+        gain.gain.setValueAtTime(0, ctx.currentTime + start);
+        gain.gain.linearRampToValueAtTime(0.35, ctx.currentTime + start + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc.start(ctx.currentTime + start);
+        osc.stop(ctx.currentTime + start + duration);
+      };
+
+      // 3 ascending rhythmic attention beeps (880Hz -> 1046Hz -> 1318Hz)
+      playTone(880, 0, 0.15);
+      playTone(1046, 0.2, 0.15);
+      playTone(1318, 0.4, 0.35);
+
+      setTimeout(() => {
+        try { ctx.close(); } catch {}
+      }, 1500);
+    } catch (err) {
+      console.warn('AudioContext beep warning:', err);
+    }
+  };
+
   // Fetch Matrix Data
   const {
     data: matrixData = { modes: [], stations: [] },
@@ -240,6 +282,45 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
     );
   });
 
+  // Monitor active sessions to play sound beep once session duration finishes
+  useEffect(() => {
+    const allActiveSessions: MatrixSession[] = [];
+    (matrixData?.stations || []).forEach((st) => {
+      if (st.active_session && !st.active_session.is_food_only) {
+        allActiveSessions.push(st.active_session);
+      }
+    });
+    if (matrixData?.vr_session && !matrixData.vr_session.is_food_only) {
+      allActiveSessions.push(matrixData.vr_session);
+    }
+
+    allActiveSessions.forEach((sess) => {
+      const allocMins = sess.allocated_minutes || 60;
+      if (allocMins <= 0) return;
+      const startMs = new Date(sess.started_at).getTime();
+      const elapsedSec = Math.floor((currentTime - startMs) / 1000);
+      const totalAllocSec = allocMins * 60;
+      const remainingSec = totalAllocSec - elapsedSec;
+
+      if (remainingSec <= 0) {
+        if (!beepedSessionsRef.current.has(sess.session_id)) {
+          beepedSessionsRef.current.add(sess.session_id);
+          playSessionBeep();
+          addNotification(
+            'SYSTEM',
+            '⏰ Session Time Over!',
+            `Duration of ${allocMins}m ended on ${sess.station_id || sess.mode_name} (${sess.customer_name}). Timer stopped. Settle invoice or extend time.`
+          );
+        }
+      } else {
+        // If remainingSec > 0 (e.g. admin extended session), allow it to beep again when new duration finishes
+        if (beepedSessionsRef.current.has(sess.session_id)) {
+          beepedSessionsRef.current.delete(sess.session_id);
+        }
+      }
+    });
+  }, [currentTime, matrixData, addNotification]);
+
   // Cell reference map for smooth scroll and highlight focus
   const cellRefs = useRef<Record<string, HTMLTableCellElement | null>>({});
 
@@ -266,6 +347,7 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
       modeName,
       customerName,
       customerPhone,
+      advancePaid,
     }: {
       stationId: string;
       modeId: string;
@@ -273,9 +355,10 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
       modeName: string;
       customerName?: string;
       customerPhone?: string;
+      advancePaid?: number;
     }) => {
       setInitiatingCell(`${modeId}-${stationId}`);
-      // Exact payload: { station_id, mode, duration_minutes, customer_name, customer_phone }
+      // Exact payload: { station_id, mode, duration_minutes, customer_name, customer_phone, advance_paid }
       return startCategorySessionApi({
         station_id: stationId,
         mode: modeName,
@@ -284,6 +367,7 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
         duration_minutes: durationMinutes,
         customer_name: customerName?.trim() || 'Walk-in Gamer',
         customer_phone: customerPhone?.trim() || undefined,
+        advance_paid: advancePaid !== undefined && advancePaid > 0 ? advancePaid : undefined,
       });
     },
     onSuccess: async (_, vars) => {
@@ -294,6 +378,11 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
         return next;
       });
       setCustomerPhones((prev) => {
+        const next = { ...prev };
+        delete next[`${vars.modeId}-${vars.stationId}`];
+        return next;
+      });
+      setAdvancePaidAmounts((prev) => {
         const next = { ...prev };
         delete next[`${vars.modeId}-${vars.stationId}`];
         return next;
@@ -442,35 +531,41 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
   const formatLiveCountdown = (startedAtIso: string, allocatedMinutes: number) => {
     try {
       const startMs = new Date(startedAtIso).getTime();
-      const elapsedSec = Math.max(0, Math.floor((currentTime - startMs) / 1000));
       const totalAllocSec = (allocatedMinutes || 60) * 60;
+      const elapsedSec = Math.max(0, Math.floor((currentTime - startMs) / 1000));
       const remainingSec = Math.max(0, totalAllocSec - elapsedSec);
+      const isCompleted = remainingSec === 0 || elapsedSec >= totalAllocSec;
+
+      // When duration ends, stop timer and cap elapsed duration to booked minutes
+      const effectiveElapsedSec = isCompleted ? totalAllocSec : elapsedSec;
+      const elHrs = Math.floor(effectiveElapsedSec / 3600);
+      const elMins = Math.floor((effectiveElapsedSec % 3600) / 60);
 
       const remHrs = Math.floor(remainingSec / 3600);
       const remMins = Math.floor((remainingSec % 3600) / 60);
       const remSecs = remainingSec % 60;
 
-      const elHrs = Math.floor(elapsedSec / 3600);
-      const elMins = Math.floor((elapsedSec % 3600) / 60);
-
-      const timeRemainingStr =
-        remHrs > 0
-          ? `${remHrs}h ${remMins.toString().padStart(2, '0')}m`
-          : `${remMins}:${remSecs.toString().padStart(2, '0')}`;
+      const timeRemainingStr = isCompleted
+        ? '00:00'
+        : remHrs > 0
+        ? `${remHrs}h ${remMins.toString().padStart(2, '0')}m`
+        : `${remMins}:${remSecs.toString().padStart(2, '0')}`;
 
       const elapsedStr = elHrs > 0 ? `${elHrs}h ${elMins}m` : `${elMins}m`;
 
       return {
         remainingStr: timeRemainingStr,
         elapsedStr,
-        isOvertime: remainingSec === 0 && elapsedSec > totalAllocSec,
-        progressPercent: Math.min(100, Math.round((elapsedSec / totalAllocSec) * 100)),
+        isOvertime: isCompleted,
+        isCompleted,
+        progressPercent: isCompleted ? 100 : Math.min(100, Math.round((elapsedSec / totalAllocSec) * 100)),
       };
     } catch {
       return {
         remainingStr: '00:00',
         elapsedStr: '0m',
         isOvertime: false,
+        isCompleted: false,
         progressPercent: 0,
       };
     }
@@ -861,6 +956,26 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                               </div>
                                             )}
 
+                                            <div>
+                                              <label className="text-[10px] uppercase text-[#64748B] font-bold block mb-1">
+                                                ADVANCE MONEY / PAID (₹):
+                                              </label>
+                                              <input
+                                                type="number"
+                                                min="0"
+                                                step="1"
+                                                placeholder="Advance ₹ (Optional)"
+                                                value={advancePaidAmounts[vrCellKey] || ''}
+                                                onChange={(e) =>
+                                                  setAdvancePaidAmounts((prev) => ({
+                                                    ...prev,
+                                                    [vrCellKey]: e.target.value,
+                                                  }))
+                                                }
+                                                className="w-full px-2.5 py-1.5 rounded-xl bg-[#FFFFFF] border border-[#E2E8F0] text-xs text-[#0F172A] placeholder-[#94A3B8] focus:outline-none focus:border-[#EA580C] font-mono transition-colors shadow-xs"
+                                              />
+                                            </div>
+
                                             <button
                                               type="button"
                                               disabled={isInitiating || !vrDurationValidation.isValid}
@@ -872,6 +987,7 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                                   modeName: 'VR Simulator',
                                                   customerName: vrActiveSession.customer_name || customerNames[vrCellKey] || 'Walk-in Gamer',
                                                   customerPhone: vrActiveSession.customer_phone || customerPhones[vrCellKey] || undefined,
+                                                  advancePaid: parseFloat(advancePaidAmounts[vrCellKey]) || 0,
                                                 })
                                               }
                                               className="w-full py-2.5 px-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 shadow-md bg-[#172554] hover:bg-[#1E3A8A] text-[#FFFFFF] cursor-pointer active:scale-98 disabled:opacity-50"
@@ -898,13 +1014,20 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                           <span className="font-mono-code text-[11px]">{vrActiveSession.allocated_minutes}m booked</span>
                                         </div>
 
-                                        <div className={`text-2xl font-black font-mono-code ${countdown.isOvertime ? 'text-[#B91C1C] animate-pulse' : 'text-[#15803D]'}`}>
+                                        <div className={`text-2xl font-black font-mono-code ${countdown.isCompleted ? 'text-[#B91C1C]' : 'text-[#15803D]'}`}>
                                           {countdown.remainingStr}
                                         </div>
 
+                                        {countdown.isCompleted && (
+                                          <div className="flex items-center justify-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#FEF2F2] border border-[#FCA5A5] text-[#991B1B] text-[10px] font-bold animate-pulse">
+                                            <AlertCircle className="w-3.5 h-3.5 text-[#DC2626]" />
+                                            <span>TIME OVER • TIMER STOPPED</span>
+                                          </div>
+                                        )}
+
                                         <div className="w-full bg-[#E2E8F0] h-2 rounded-full overflow-hidden">
                                           <div
-                                            className={`h-full transition-all duration-1000 ${countdown.isOvertime ? 'bg-[#B91C1C]' : 'bg-[#15803D]'}`}
+                                            className={`h-full transition-all duration-1000 ${countdown.isCompleted ? 'bg-[#B91C1C]' : 'bg-[#15803D]'}`}
                                             style={{ width: `${countdown.progressPercent}%` }}
                                           />
                                         </div>
@@ -988,12 +1111,36 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                           </div>
                                         )}
 
-                                        <div className="flex items-center justify-between p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
-                                          <span className="text-xs text-[#64748B] font-medium">Running Total:</span>
-                                          <span className="text-base font-black font-mono-code text-[#172554]">
-                                            ₹{Number(vrActiveSession.running_total || vrActiveSession.time_charge || 0).toFixed(2)}
-                                          </span>
-                                        </div>
+                                        {(() => {
+                                          const vrGrossTotal = Number(vrActiveSession.running_total || vrActiveSession.time_charge || 0);
+                                          const vrAdvance = Number(vrActiveSession.advance_paid || 0);
+                                          const vrBalance = Math.max(0, vrGrossTotal - vrAdvance);
+
+                                          return (
+                                            <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-1 text-[11px]">
+                                              <div className="flex items-center justify-between text-[#64748B]">
+                                                <span className="font-medium">Total Bill:</span>
+                                                <span className="font-mono-code font-bold text-[#0F172A]">
+                                                  ₹{vrGrossTotal.toFixed(2)}
+                                                </span>
+                                              </div>
+                                              {vrAdvance > 0 && (
+                                                <div className="flex items-center justify-between text-[#15803D]">
+                                                  <span className="font-medium">Advance Paid:</span>
+                                                  <span className="font-mono-code font-bold">
+                                                    -₹{vrAdvance.toFixed(2)}
+                                                  </span>
+                                                </div>
+                                              )}
+                                              <div className="flex items-center justify-between pt-1 border-t border-[#E2E8F0]">
+                                                <span className="text-xs text-[#172554] font-bold">Balance Due:</span>
+                                                <span className="text-base font-black font-mono-code text-[#172554]">
+                                                  ₹{vrBalance.toFixed(2)}
+                                                </span>
+                                              </div>
+                                            </div>
+                                          );
+                                        })()}
 
                                         {hasPendingVrOrders && (
                                           <div className="p-1.5 rounded-xl bg-[#FFFBEB] border border-[#FDE68A] text-[#B45309] text-[10px] font-bold flex items-center gap-1">
@@ -1149,6 +1296,25 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                             className="w-full px-3 py-2 rounded-xl bg-[#FFFFFF] border border-[#E2E8F0] text-xs text-[#0F172A] placeholder-[#94A3B8] focus:outline-none focus:border-[#EA580C] font-mono transition-colors shadow-xs"
                                           />
                                         </div>
+                                        <div>
+                                          <label className="text-[10px] uppercase text-[#64748B] font-bold block mb-1">
+                                            ADVANCE MONEY / PAID (₹):
+                                          </label>
+                                          <input
+                                            type="number"
+                                            min="0"
+                                            step="1"
+                                            placeholder="Advance ₹ (Optional)"
+                                            value={advancePaidAmounts[vrCellKey] || ''}
+                                            onChange={(e) =>
+                                              setAdvancePaidAmounts((prev) => ({
+                                                ...prev,
+                                                [vrCellKey]: e.target.value,
+                                              }))
+                                            }
+                                            className="w-full px-3 py-2 rounded-xl bg-[#FFFFFF] border border-[#E2E8F0] text-xs text-[#0F172A] placeholder-[#94A3B8] focus:outline-none focus:border-[#EA580C] font-mono transition-colors shadow-xs"
+                                          />
+                                        </div>
                                       </div>
 
                                       {/* Duration Selector & Start Button */}
@@ -1220,6 +1386,7 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                               modeName: mode.name,
                                               customerName: customerNames[vrCellKey],
                                               customerPhone: customerPhones[vrCellKey],
+                                              advancePaid: parseFloat(advancePaidAmounts[vrCellKey]) || 0,
                                             })
                                           }
                                           className={`sm:w-44 py-3 px-3 rounded-xl font-bold text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 shadow-sm active:scale-98 disabled:opacity-50 shrink-0 ${
@@ -1446,6 +1613,26 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                             </div>
                                           )}
 
+                                          <div>
+                                            <label className="text-[10px] uppercase text-[#64748B] font-bold block mb-1">
+                                              ADVANCE MONEY / PAID (₹):
+                                            </label>
+                                            <input
+                                              type="number"
+                                              min="0"
+                                              step="1"
+                                              placeholder="Advance ₹ (Optional)"
+                                              value={advancePaidAmounts[cellKey] || ''}
+                                              onChange={(e) =>
+                                                setAdvancePaidAmounts((prev) => ({
+                                                  ...prev,
+                                                  [cellKey]: e.target.value,
+                                                }))
+                                              }
+                                              className="w-full px-2.5 py-1.5 rounded-xl bg-[#FFFFFF] border border-[#E2E8F0] text-xs text-[#0F172A] placeholder-[#94A3B8] focus:outline-none focus:border-[#EA580C] font-mono transition-colors shadow-xs"
+                                            />
+                                          </div>
+
                                           <button
                                             type="button"
                                             disabled={isInitiating || !durationValidation.isValid}
@@ -1457,6 +1644,7 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                                 modeName: mode.name,
                                                 customerName: activeSession.customer_name || customerNames[cellKey] || 'Walk-in Gamer',
                                                 customerPhone: activeSession.customer_phone || customerPhones[cellKey] || undefined,
+                                                advancePaid: parseFloat(advancePaidAmounts[cellKey]) || 0,
                                               })
                                             }
                                             className="w-full py-2.5 px-3 rounded-xl font-black text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 shadow-md bg-[#172554] hover:bg-[#1E3A8A] text-[#FFFFFF] cursor-pointer active:scale-98 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1483,18 +1671,25 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                           </div>
                                           <span
                                             className={`font-black text-sm font-mono-code ${
-                                              countdown.isOvertime ? 'text-[#B91C1C] animate-pulse' : 'text-[#15803D]'
+                                              countdown.isCompleted ? 'text-[#B91C1C]' : 'text-[#15803D]'
                                             }`}
                                           >
                                             {countdown.remainingStr}
                                           </span>
                                         </div>
 
+                                        {countdown.isCompleted && (
+                                          <div className="flex items-center justify-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#FEF2F2] border border-[#FCA5A5] text-[#991B1B] text-[10px] font-bold animate-pulse">
+                                            <AlertCircle className="w-3.5 h-3.5 text-[#DC2626]" />
+                                            <span>TIME OVER • TIMER STOPPED</span>
+                                          </div>
+                                        )}
+
                                         {/* Progress Bar */}
                                         <div className="w-full bg-[#E2E8F0] rounded-full h-1.5 overflow-hidden">
                                           <div
                                             className={`h-full transition-all duration-1000 ${
-                                              countdown.isOvertime
+                                              countdown.isCompleted
                                                 ? 'bg-[#B91C1C]'
                                                 : 'bg-[#15803D]'
                                             }`}
@@ -1637,6 +1832,8 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                               {(() => {
                                 const liveSnackTotal = Number(activeSession.orders_charge || 0);
                                 const liveTotalBillable = Number(activeSession.running_total || (Number(activeSession.time_charge || 0) + liveSnackTotal));
+                                const advancePaid = Number(activeSession.advance_paid || 0);
+                                const balanceDue = Math.max(0, liveTotalBillable - advancePaid);
 
                                 return (
                                   <div className="p-2.5 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-1 text-[11px]">
@@ -1653,9 +1850,23 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                       </span>
                                     </div>
                                     <div className="flex justify-between font-bold text-[#0F172A] pt-1 border-t border-[#E2E8F0]">
-                                      <span className="text-[#172554]">Total Billable:</span>
-                                      <span className="text-[#172554] font-black text-xs font-mono-code">
+                                      <span className="text-[#64748B]">Total Billable:</span>
+                                      <span className="text-[#0F172A] font-bold font-mono-code">
                                         ₹{liveTotalBillable.toFixed(2)}
+                                      </span>
+                                    </div>
+                                    {advancePaid > 0 && (
+                                      <div className="flex justify-between font-bold text-[#15803D]">
+                                        <span>Advance Paid:</span>
+                                        <span className="font-mono-code font-bold">
+                                          -₹{advancePaid.toFixed(2)}
+                                        </span>
+                                      </div>
+                                    )}
+                                    <div className="flex justify-between font-bold text-[#172554] pt-1 border-t border-[#E2E8F0]">
+                                      <span className="text-[#172554]">Balance Due:</span>
+                                      <span className="text-[#172554] font-black text-xs font-mono-code">
+                                        ₹{balanceDue.toFixed(2)}
                                       </span>
                                     </div>
                                   </div>
@@ -1866,6 +2077,25 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                       className="w-full px-2.5 py-1.5 rounded-xl bg-[#FFF7ED] border border-[#E2E8F0] text-xs text-[#0F172A] placeholder-[#94A3B8] focus:outline-none focus:border-[#EA580C] font-mono transition-colors"
                                     />
                                   </div>
+                                  <div>
+                                    <label className="text-[10px] uppercase text-[#64748B] font-bold block mb-1">
+                                      ADVANCE (₹):
+                                    </label>
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      step="1"
+                                      placeholder="₹ (Optional)"
+                                      value={advancePaidAmounts[cellKey] || ''}
+                                      onChange={(e) =>
+                                        setAdvancePaidAmounts((prev) => ({
+                                          ...prev,
+                                          [cellKey]: e.target.value,
+                                        }))
+                                      }
+                                      className="w-full px-2.5 py-1.5 rounded-xl bg-[#FFF7ED] border border-[#E2E8F0] text-xs text-[#0F172A] placeholder-[#94A3B8] focus:outline-none focus:border-[#EA580C] font-mono transition-colors"
+                                    />
+                                  </div>
                                 </div>
 
                                 {/* Duration Selector Buttons with Overlap Capping */}
@@ -1943,6 +2173,7 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                       modeName: mode.name,
                                       customerName: customerNames[cellKey],
                                       customerPhone: customerPhones[cellKey],
+                                      advancePaid: parseFloat(advancePaidAmounts[cellKey]) || 0,
                                     })
                                   }
                                   className={`w-full py-2.5 px-3 rounded-xl font-bold text-xs uppercase tracking-wider transition-all flex items-center justify-center gap-1.5 shadow-sm active:scale-98 disabled:opacity-50 ${

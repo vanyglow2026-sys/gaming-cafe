@@ -116,6 +116,7 @@ class Session(Base):
     )
     status: Mapped[str] = mapped_column(String(20), default=SessionStatus.ACTIVE.value, nullable=False)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0.00"), nullable=False)
+    advance_paid: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0.00"), nullable=False)
     allocated_minutes: Mapped[int] = mapped_column(Integer, default=60, nullable=True)
     tier_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     category_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)

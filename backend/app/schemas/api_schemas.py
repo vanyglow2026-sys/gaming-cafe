@@ -69,6 +69,8 @@ class StationLiveResponse(BaseModel):
     time_charge: Decimal = Decimal("0.00")
     orders_charge: Decimal = Decimal("0.00")
     running_total: Decimal = Decimal("0.00")
+    advance_paid: Decimal = Decimal("0.00")
+    balance_due: Decimal = Decimal("0.00")
     active_orders_count: int = 0
     device_name: Optional[str] = None
     allocated_console: Optional[str] = None
@@ -144,6 +146,7 @@ class SessionResponse(BaseModel):
     total_amount: Decimal
     allocated_minutes: Optional[int] = 60
     tier_price: Optional[Decimal] = None
+    advance_paid: Decimal = Decimal("0.00")
     category_id: Optional[str] = None
     device_name: Optional[str] = None
 
@@ -180,6 +183,7 @@ class SessionResponse(BaseModel):
             "total_amount": getattr(data, "total_amount", Decimal("0.00")),
             "allocated_minutes": getattr(data, "allocated_minutes", 60),
             "tier_price": getattr(data, "tier_price", None),
+            "advance_paid": getattr(data, "advance_paid", Decimal("0.00")),
             "category_id": getattr(data, "category_id", None),
             "device_name": dev_name,
         }
@@ -217,6 +221,7 @@ class SessionStartRequest(BaseModel):
     customer_phone: Optional[str] = None
     user_id: Optional[str] = None
     tier_price: Optional[Decimal] = None
+    advance_paid: Optional[Decimal] = Decimal("0.00")
 
     @model_validator(mode="before")
     @classmethod
@@ -249,6 +254,8 @@ class MatrixSessionDetail(BaseModel):
     time_charge: Decimal
     orders_charge: Decimal
     running_total: Decimal
+    advance_paid: Decimal = Decimal("0.00")
+    balance_due: Decimal = Decimal("0.00")
     active_orders_count: int = 0
     hourly_rate: Decimal
     pricing_tiers: List[PricingTier] = Field(default_factory=list)
@@ -372,6 +379,8 @@ class CheckoutResponse(BaseModel):
     station_charge: Decimal
     orders_charge: Decimal
     total_amount: Decimal
+    advance_paid: Decimal = Decimal("0.00")
+    balance_due: Decimal = Decimal("0.00")
     payment_method: str
     payment_status: str
     upi_qr_string: Optional[str] = None

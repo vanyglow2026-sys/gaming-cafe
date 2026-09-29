@@ -26,6 +26,8 @@ export interface StationLive {
   time_charge: string | number;
   orders_charge: string | number;
   running_total: string | number;
+  advance_paid?: string | number;
+  balance_due?: string | number;
   active_orders_count: number;
   device_name?: string | null;
   allocated_console?: string | null;
@@ -74,6 +76,8 @@ export interface CheckoutResult {
   time_charge?: string | number;
   orders_charge: string | number;
   total_amount: string | number;
+  advance_paid?: string | number;
+  balance_due?: string | number;
   payment_method: 'CASH' | 'UPI';
   payment_status: string;
   upi_qr_string?: string | null;
@@ -227,6 +231,7 @@ export interface SessionStartPayload {
   customer_phone?: string;
   user_id?: string;
   tier_price?: number;
+  advance_paid?: number;
 }
 
 export interface SessionResponse {
@@ -242,6 +247,7 @@ export interface SessionResponse {
   total_amount: number | string;
   allocated_minutes?: number;
   tier_price?: number | string;
+  advance_paid?: number | string;
   category_id?: string;
   device_name?: string;
 }
@@ -260,6 +266,8 @@ export interface MatrixSession {
   time_charge: number;
   orders_charge: number;
   running_total: number;
+  advance_paid?: number;
+  balance_due?: number;
   active_orders_count: number;
   hourly_rate: number;
   pricing_tiers: PricingTier[];

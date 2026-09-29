@@ -102,6 +102,7 @@ async def start_experience_session_endpoint(
         customer_phone=customer_phone,
         user_id=user_id,
         tier_price=payload.tier_price,
+        advance_paid=payload.advance_paid,
     )
 
 
@@ -293,6 +294,8 @@ async def get_live_stations(
                         time_charge=time_charge,
                         orders_charge=orders_charge,
                         running_total=running_total,
+                        advance_paid=active_session.advance_paid or Decimal("0.00"),
+                        balance_due=max(Decimal("0.00"), running_total - (active_session.advance_paid or Decimal("0.00"))),
                         active_orders_count=active_orders_count,
                         device_name=active_session.device_name,
                         allocated_console=active_session.device_name,

@@ -129,3 +129,33 @@ def test_idempotency_cache_lru_eviction():
     assert cache.get("k1") is None
     assert cache.get("k2") is not None
     assert cache.get("k3") is not None
+
+
+def test_session_service_duration_overtime_capped():
+    from app.services.session_service import _compute_time_charge
+    from app.models.entities import Session as CafeSession, Station
+
+    # Station with 200/hr
+    station = Station(
+        id=uuid.uuid4(),
+        name="PS5-01",
+        tier="CONSOLE",
+        hourly_rate=Decimal("200.00"),
+    )
+
+    # Session booked for 60m with tier_price 150.00
+    # Started 120 minutes ago (120 minutes elapsed, 60 minutes overtime!)
+    now = datetime.now(timezone.utc)
+    started_at = now - timedelta(minutes=120)
+
+    # Without admin explicitly extending, time charge must stay strictly 150.00
+    charge = _compute_time_charge(
+        tier_price=Decimal("150.00"),
+        elapsed_minutes=120,
+        allocated_minutes=60,
+        hourly_rate=Decimal("200.00"),
+        started_at=started_at,
+        reference_time=now,
+    )
+    assert charge == Decimal("150.00")
+

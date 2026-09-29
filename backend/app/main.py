@@ -57,6 +57,7 @@ async def run_schema_migrations():
             "ALTER TABLE sessions ADD COLUMN customer_name VARCHAR(100)",
             "ALTER TABLE sessions ADD COLUMN customer_phone VARCHAR(20)",
             "ALTER TABLE sessions ADD COLUMN user_id VARCHAR(36)",
+            "ALTER TABLE sessions ADD COLUMN advance_paid NUMERIC(10, 2) DEFAULT 0.00",
             "ALTER TABLE sessions ADD COLUMN allocated_minutes INTEGER DEFAULT 60",
             "ALTER TABLE sessions ADD COLUMN tier_price NUMERIC(10, 2)",
             "ALTER TABLE sessions ADD COLUMN category_id VARCHAR(50)",
