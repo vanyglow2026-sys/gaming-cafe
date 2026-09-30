@@ -474,10 +474,20 @@ app.include_router(payment_router, prefix=settings.API_V1_STR)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Unified API Error Handling
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+def _inject_cors_headers(request: Request, response: JSONResponse) -> JSONResponse:
+    origin = request.headers.get("origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = _CORS_ALLOW_METHODS
+        response.headers["Access-Control-Allow-Headers"] = _CORS_ALLOW_HEADERS
+    return response
+
+
 @app.exception_handler(StarletteHTTPException)
 async def unified_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=exc.status_code,
         content={
             "detail": exc.detail,
@@ -487,11 +497,12 @@ async def unified_http_exception_handler(request: Request, exc: StarletteHTTPExc
         },
         headers=getattr(exc, "headers", None),
     )
+    return _inject_cors_headers(request, resp)
 
 
 @app.exception_handler(RequestValidationError)
 async def unified_validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": "Request validation failed. Please check your input parameters.",
@@ -501,12 +512,13 @@ async def unified_validation_exception_handler(request: Request, exc: RequestVal
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     )
+    return _inject_cors_headers(request, resp)
 
 
 @app.exception_handler(Exception)
 async def unified_unhandled_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled server exception on %s: %s", request.url.path, exc, exc_info=True)
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "detail": "An internal server error occurred.",
@@ -515,6 +527,7 @@ async def unified_unhandled_exception_handler(request: Request, exc: Exception):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     )
+    return _inject_cors_headers(request, resp)
 
 
 @app.get("/api/v1/fleet/categories", response_model=List[CategoryAvailabilityResponse], tags=["Fleet Categories"])

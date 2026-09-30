@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 import pytest
 import pytest_asyncio
@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from app.core.database import Base
 from app.api.deps import get_db
 from app.main import app
-from app.models.entities import Station, MenuItem
+from app.models.entities import Station, MenuItem, Session, Payment
+from app.models.enums import SessionStatus, PaymentStatus, PaymentMethod
 
 
 @pytest_asyncio.fixture
@@ -144,20 +145,87 @@ async def test_order_accept_deducts_inventory_and_reject_does_not(orders_test_db
 
 @pytest.mark.asyncio
 async def test_revenue_analytics_database_endpoint(orders_test_db):
+    async_session = orders_test_db
+    now = datetime.now(timezone.utc)
+    async with async_session() as s:
+        st_gaming = Station(
+            id=uuid.uuid4(),
+            name="Solo Station 1",
+            tier="CONSOLE",
+            hourly_rate=Decimal("150.00"),
+            status="AVAILABLE",
+        )
+        st_cafe = Station(
+            id=uuid.uuid4(),
+            name="Walk-in CAFE",
+            tier="CAFE",
+            hourly_rate=Decimal("0.00"),
+            status="AVAILABLE",
+        )
+        s.add_all([st_gaming, st_cafe])
+        await s.flush()
+
+        sess_gaming = Session(
+            id=uuid.uuid4(),
+            station_id=st_gaming.id,
+            customer_name="Aman Sharma",
+            started_at=now - timedelta(hours=2),
+            ended_at=now - timedelta(hours=1),
+            status=SessionStatus.COMPLETED.value,
+            station_name="Solo Station 1",
+            total_amount=Decimal("300.00"),
+            allocated_minutes=120,
+        )
+        sess_cafe = Session(
+            id=uuid.uuid4(),
+            station_id=st_cafe.id,
+            customer_name="Priya Patel",
+            started_at=now - timedelta(minutes=45),
+            ended_at=now - timedelta(minutes=15),
+            status=SessionStatus.COMPLETED.value,
+            station_name="Walk-in CAFE",
+            total_amount=Decimal("250.00"),
+            allocated_minutes=0,
+        )
+        s.add_all([sess_gaming, sess_cafe])
+        await s.flush()
+
+        pay_cash = Payment(
+            id=uuid.uuid4(),
+            session_id=sess_gaming.id,
+            amount=Decimal("300.00"),
+            method=PaymentMethod.CASH.value,
+            status=PaymentStatus.COMPLETED.value,
+            idempotency_key=str(uuid.uuid4()),
+        )
+        pay_upi = Payment(
+            id=uuid.uuid4(),
+            session_id=sess_cafe.id,
+            amount=Decimal("250.00"),
+            method=PaymentMethod.UPI.value,
+            status=PaymentStatus.COMPLETED.value,
+            idempotency_key=str(uuid.uuid4()),
+        )
+        s.add_all([pay_cash, pay_upi])
+        await s.commit()
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.get("/api/v1/admin/analytics/revenue?period=DAY")
-        assert res.status_code == 200
-        data = res.json()
-        assert "totalRevenue" in data
-        assert "gamingRevenue" in data
-        assert "foodRevenue" in data
-        assert "cashRevenue" in data
-        assert "upiRevenue" in data
-        assert "cashCount" in data
-        assert "upiCount" in data
-        assert "chartData" in data
-        assert isinstance(data["chartData"], list)
+        for p in ["DAY", "WEEK", "MONTH"]:
+            res = await client.get(f"/api/v1/admin/analytics/revenue?period={p}")
+            assert res.status_code == 200
+            data = res.json()
+            assert "totalRevenue" in data
+            assert data["totalRevenue"] == 550.0
+            assert data["gamingRevenue"] == 300.0
+            assert data["foodRevenue"] == 250.0
+            assert data["cashRevenue"] == 300.0
+            assert data["upiRevenue"] == 250.0
+            assert data["cashCount"] == 1
+            assert data["upiCount"] == 1
+            assert data["sessionsCount"] == 2
+            assert "chartData" in data
+            assert len(data["chartData"]) > 0
 
 
 @pytest.mark.asyncio

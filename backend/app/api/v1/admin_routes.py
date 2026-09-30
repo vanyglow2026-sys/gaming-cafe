@@ -1407,175 +1407,195 @@ async def get_revenue_analytics(
     Computes real-time revenue analytics directly from database sessions, payments, and orders.
     Zero localStorage or mock data.
     """
-    now = datetime.now(timezone.utc)
-    if period.upper() == "DAY":
-        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        days_to_show = 1
-    elif period.upper() == "WEEK":
-        cutoff = now - timedelta(days=7)
-        days_to_show = 7
-    else:
-        cutoff = now - timedelta(days=30)
-        days_to_show = 14
-
-    stmt = (
-        select(Session)
-        .where(
-            Session.status == SessionStatus.COMPLETED.value,
-            func.coalesce(Session.ended_at, Session.started_at) >= cutoff,
-        )
-        .options(
-            selectinload(Session.orders).selectinload(Order.items).selectinload(OrderItem.menu_item),
-            selectinload(Session.payments),
-        )
-    )
-    result = await db.execute(stmt)
-    sessions = result.scalars().all()
-
-    total_revenue = Decimal("0.00")
-    gaming_revenue = Decimal("0.00")
-    food_revenue = Decimal("0.00")
-    cash_revenue = Decimal("0.00")
-    upi_revenue = Decimal("0.00")
-    cash_count = 0
-    upi_count = 0
-    sessions_count = len(sessions)
-    item_counts: dict[str, int] = defaultdict(int)
-
-    daily_stats: dict[str, dict[str, Decimal]] = defaultdict(
-        lambda: {
-            "total": Decimal("0.00"),
-            "gaming": Decimal("0.00"),
-            "food": Decimal("0.00"),
-            "cash": Decimal("0.00"),
-            "upi": Decimal("0.00"),
-        }
-    )
-
-    for s in sessions:
-        # Strictly settled/completed sessions only
-        settled_at = ensure_utc(s.ended_at or s.started_at)
-        day_key = settled_at.strftime("%Y-%m-%d")
-
-        s_total = s.total_amount if (s.total_amount is not None and s.total_amount > Decimal("0.00")) else Decimal("0.00")
-
-        # Aggregate food orders completed/served for this settled session
-        s_food_charge = Decimal("0.00")
-        for o in s.orders:
-            if o.status in (OrderStatus.SERVED.value, "SERVED", "served"):
-                for itm in o.items:
-                    qty = Decimal(str(itm.quantity))
-                    u_price = itm.unit_price or Decimal("0.00")
-                    s_food_charge += (u_price * qty).quantize(CURRENCY_QUANTIZATION)
-                    name = itm.menu_item.name if itm.menu_item else "Item"
-                    item_counts[name] += itm.quantity
-
-        is_cafe = bool(
-            (s.station_name and "CAFE" in s.station_name.upper()) or
-            (s.tier and "CAFE" in str(s.tier).upper())
-        )
-
-        if is_cafe:
-            s_time_charge = Decimal("0.00")
-            s_food_charge = s_total
+    try:
+        now = datetime.now(timezone.utc)
+        if period.upper() == "DAY":
+            cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            days_to_show = 1
+        elif period.upper() == "WEEK":
+            cutoff = now - timedelta(days=7)
+            days_to_show = 7
         else:
-            s_food_charge = min(s_food_charge, s_total)
-            s_time_charge = max(Decimal("0.00"), s_total - s_food_charge)
+            cutoff = now - timedelta(days=30)
+            days_to_show = 30
 
-        gaming_revenue += s_time_charge
-        food_revenue += s_food_charge
-        total_revenue += s_total
-
-        # Reconcile Payment Method attribution (Cash vs UPI/QR)
-        completed_payments = [
-            p for p in (s.payments or [])
-            if getattr(p, "status", None) in (PaymentStatus.COMPLETED.value, "COMPLETED")
-        ]
-
-        s_cash = Decimal("0.00")
-        s_upi = Decimal("0.00")
-
-        if completed_payments:
-            p_cash = sum(
-                (p.amount for p in completed_payments if "CASH" in (p.method or "").upper()),
-                Decimal("0.00"),
+        stmt = (
+            select(Session)
+            .where(
+                Session.status == SessionStatus.COMPLETED.value,
+                func.coalesce(Session.ended_at, Session.started_at) >= cutoff,
             )
-            p_upi = sum(
-                (p.amount for p in completed_payments if "UPI" in (p.method or "").upper()),
-                Decimal("0.00"),
+            .options(
+                selectinload(Session.station),
+                selectinload(Session.orders).selectinload(Order.items).selectinload(OrderItem.menu_item),
+                selectinload(Session.payments),
             )
-            paid_sum = p_cash + p_upi
-            if paid_sum > Decimal("0.00"):
-                s_cash = (s_total * (p_cash / paid_sum)).quantize(CURRENCY_QUANTIZATION)
-                s_upi = s_total - s_cash
-            else:
-                first_meth = (completed_payments[0].method or "").upper()
-                if "UPI" in first_meth:
-                    s_upi = s_total
-                else:
-                    s_cash = s_total
+        )
+        result = await db.execute(stmt)
+        sessions = result.scalars().all()
 
-            cash_items = len([p for p in completed_payments if "CASH" in (p.method or "").upper()])
-            upi_items = len([p for p in completed_payments if "UPI" in (p.method or "").upper()])
-            cash_count += cash_items
-            upi_count += upi_items
-        elif s_total > Decimal("0.00"):
-            # Default to Cash for completed sessions without explicit payment rows
-            s_cash = s_total
-            cash_count += 1
+        total_revenue = Decimal("0.00")
+        gaming_revenue = Decimal("0.00")
+        food_revenue = Decimal("0.00")
+        cash_revenue = Decimal("0.00")
+        upi_revenue = Decimal("0.00")
+        cash_count = 0
+        upi_count = 0
+        sessions_count = len(sessions)
+        item_counts: dict[str, int] = defaultdict(int)
 
-        cash_revenue += s_cash
-        upi_revenue += s_upi
-
-        daily_stats[day_key]["gaming"] += s_time_charge
-        daily_stats[day_key]["food"] += s_food_charge
-        daily_stats[day_key]["total"] += s_total
-        daily_stats[day_key]["cash"] += s_cash
-        daily_stats[day_key]["upi"] += s_upi
-
-    average_session_bill = (
-        float(total_revenue / Decimal(str(sessions_count))) if sessions_count > 0 else 0.0
-    )
-
-    top_item = "None"
-    if item_counts:
-        top_item = max(item_counts.items(), key=lambda x: x[1])[0]
-
-    chart_data = []
-    for i in range(days_to_show - 1, -1, -1):
-        d = now - timedelta(days=i)
-        d_key = d.strftime("%Y-%m-%d")
-        label = d.strftime("%a, %b %d") if days_to_show > 1 else "Today"
-        day_stat = daily_stats.get(
-            d_key,
-            {
+        daily_stats: dict[str, dict[str, Decimal]] = defaultdict(
+            lambda: {
                 "total": Decimal("0.00"),
                 "gaming": Decimal("0.00"),
                 "food": Decimal("0.00"),
                 "cash": Decimal("0.00"),
                 "upi": Decimal("0.00"),
-            },
+            }
         )
-        chart_data.append({
-            "label": label,
-            "total": float(day_stat["total"]),
-            "gaming": float(day_stat["gaming"]),
-            "food": float(day_stat["food"]),
-            "cash": float(day_stat["cash"]),
-            "upi": float(day_stat["upi"]),
-        })
 
-    return {
-        "totalRevenue": float(total_revenue),
-        "gamingRevenue": float(gaming_revenue),
-        "foodRevenue": float(food_revenue),
-        "cashRevenue": float(cash_revenue),
-        "upiRevenue": float(upi_revenue),
-        "cashCount": cash_count,
-        "upiCount": upi_count,
-        "sessionsCount": sessions_count,
-        "averageSessionBill": round(average_session_bill, 2),
-        "topSellingItem": top_item,
-        "chartData": chart_data,
-    }
+        for s in sessions:
+            # Strictly settled/completed sessions only
+            settled_at = ensure_utc(s.ended_at or s.started_at or now)
+            day_key = settled_at.strftime("%Y-%m-%d")
+
+            s_total = s.total_amount if (s.total_amount is not None and s.total_amount > Decimal("0.00")) else Decimal("0.00")
+
+            # Aggregate food orders completed/served for this settled session
+            s_food_charge = Decimal("0.00")
+            for o in s.orders:
+                if o.status in (OrderStatus.SERVED.value, "SERVED", "served"):
+                    for itm in o.items:
+                        qty = Decimal(str(itm.quantity))
+                        u_price = itm.unit_price or Decimal("0.00")
+                        s_food_charge += (u_price * qty).quantize(CURRENCY_QUANTIZATION)
+                        name = itm.menu_item.name if itm.menu_item else "Item"
+                        item_counts[name] += itm.quantity
+
+            is_cafe = bool(
+                (s.station_name and "CAFE" in s.station_name.upper())
+                or (s.category_id and any(c in s.category_id.lower() for c in ("dine-in", "dine-out", "cafe")))
+                or (s.device_name and "cafe" in s.device_name.lower())
+                or (s.station and getattr(s.station, "tier", None) and "CAFE" in str(s.station.tier).upper())
+                or (getattr(s, "tier", None) and "CAFE" in str(getattr(s, "tier", "")).upper())
+            )
+
+            if is_cafe:
+                s_time_charge = Decimal("0.00")
+                s_food_charge = s_total
+            else:
+                s_food_charge = min(s_food_charge, s_total)
+                s_time_charge = max(Decimal("0.00"), s_total - s_food_charge)
+
+            gaming_revenue += s_time_charge
+            food_revenue += s_food_charge
+            total_revenue += s_total
+
+            # Reconcile Payment Method attribution (Cash vs UPI/QR)
+            completed_payments = [
+                p for p in (s.payments or [])
+                if getattr(p, "status", None) in (PaymentStatus.COMPLETED.value, "COMPLETED")
+            ]
+
+            s_cash = Decimal("0.00")
+            s_upi = Decimal("0.00")
+
+            if completed_payments:
+                p_cash = sum(
+                    (p.amount for p in completed_payments if "CASH" in (p.method or "").upper()),
+                    Decimal("0.00"),
+                )
+                p_upi = sum(
+                    (p.amount for p in completed_payments if "UPI" in (p.method or "").upper()),
+                    Decimal("0.00"),
+                )
+                paid_sum = p_cash + p_upi
+                if paid_sum > Decimal("0.00"):
+                    s_cash = (s_total * (p_cash / paid_sum)).quantize(CURRENCY_QUANTIZATION)
+                    s_upi = s_total - s_cash
+                else:
+                    first_meth = (completed_payments[0].method or "").upper()
+                    if "UPI" in first_meth:
+                        s_upi = s_total
+                    else:
+                        s_cash = s_total
+
+                cash_items = len([p for p in completed_payments if "CASH" in (p.method or "").upper()])
+                upi_items = len([p for p in completed_payments if "UPI" in (p.method or "").upper()])
+                cash_count += cash_items
+                upi_count += upi_items
+            elif s_total > Decimal("0.00"):
+                # Default to Cash for completed sessions without explicit payment rows
+                s_cash = s_total
+                cash_count += 1
+
+            cash_revenue += s_cash
+            upi_revenue += s_upi
+
+            daily_stats[day_key]["gaming"] += s_time_charge
+            daily_stats[day_key]["food"] += s_food_charge
+            daily_stats[day_key]["total"] += s_total
+            daily_stats[day_key]["cash"] += s_cash
+            daily_stats[day_key]["upi"] += s_upi
+
+        average_session_bill = (
+            float(total_revenue / Decimal(str(sessions_count))) if sessions_count > 0 else 0.0
+        )
+
+        top_item = "None"
+        if item_counts:
+            top_item = max(item_counts.items(), key=lambda x: x[1])[0]
+
+        chart_data = []
+        for i in range(days_to_show - 1, -1, -1):
+            d = now - timedelta(days=i)
+            d_key = d.strftime("%Y-%m-%d")
+            label = d.strftime("%a, %b %d") if days_to_show > 1 else "Today"
+            day_stat = daily_stats.get(
+                d_key,
+                {
+                    "total": Decimal("0.00"),
+                    "gaming": Decimal("0.00"),
+                    "food": Decimal("0.00"),
+                    "cash": Decimal("0.00"),
+                    "upi": Decimal("0.00"),
+                },
+            )
+            chart_data.append({
+                "label": label,
+                "total": float(day_stat["total"]),
+                "gaming": float(day_stat["gaming"]),
+                "food": float(day_stat["food"]),
+                "cash": float(day_stat["cash"]),
+                "upi": float(day_stat["upi"]),
+            })
+
+        return {
+            "totalRevenue": float(total_revenue),
+            "gamingRevenue": float(gaming_revenue),
+            "foodRevenue": float(food_revenue),
+            "cashRevenue": float(cash_revenue),
+            "upiRevenue": float(upi_revenue),
+            "cashCount": cash_count,
+            "upiCount": upi_count,
+            "sessionsCount": sessions_count,
+            "averageSessionBill": round(average_session_bill, 2),
+            "topSellingItem": top_item,
+            "chartData": chart_data,
+        }
+    except Exception as exc:
+        logger.error("Error computing revenue analytics: %s", exc, exc_info=True)
+        return {
+            "totalRevenue": 0.0,
+            "gamingRevenue": 0.0,
+            "foodRevenue": 0.0,
+            "cashRevenue": 0.0,
+            "upiRevenue": 0.0,
+            "cashCount": 0,
+            "upiCount": 0,
+            "sessionsCount": 0,
+            "averageSessionBill": 0.0,
+            "topSellingItem": "None",
+            "chartData": [],
+        }
 
