@@ -275,8 +275,14 @@ async def place_in_seat_order(
             select(Session)
             .where(
                 Session.status == SessionStatus.ACTIVE.value,
-                func.upper(Session.device_name) == "WALK-IN CAFE",
                 func.upper(Session.customer_name) == func.upper(cust_norm),
+                or_(
+                    func.upper(Session.station_name) == "WALK-IN CAFE",
+                    func.upper(Session.device_name) == "WALK-IN CAFE",
+                    func.upper(Session.console_room) == "WALK-IN CAFE",
+                    Session.category_id.ilike("%dine%"),
+                    Session.category_id.ilike("%cafe%"),
+                ),
             )
             .options(selectinload(Session.station))
         )
@@ -298,7 +304,7 @@ async def place_in_seat_order(
             cafe_session = Session(
                 station_id=cafe_st.id,
                 station_name="Walk-in CAFE",
-                device_name="Walk-in CAFE",
+                device_name=None,
                 console_room="Walk-in CAFE",
                 category_id=target_mode,
                 customer_name=payload.customerName,

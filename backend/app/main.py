@@ -66,6 +66,7 @@ async def run_schema_migrations():
             "ALTER TABLE sessions ADD COLUMN console_room VARCHAR(50)",
             "ALTER TABLE orders ADD COLUMN customer_name VARCHAR(100)",
             "DROP INDEX IF EXISTS uq_active_station_session",
+            "UPDATE sessions SET device_name = NULL WHERE UPPER(device_name) = 'WALK-IN CAFE'",
             "CREATE TABLE IF NOT EXISTS advance_bookings ("
             "  id VARCHAR(50) PRIMARY KEY,"
             "  customer_name VARCHAR(100) NOT NULL,"

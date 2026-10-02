@@ -1142,7 +1142,7 @@ async def place_station_food_order(
             cafe_session = Session(
                 station_id=target_station.id,
                 station_name=target_station.name or "Walk-in CAFE",
-                device_name=target_station.name or "Walk-in CAFE",
+                device_name=None,
                 console_room=target_station.name or "Walk-in CAFE",
                 category_id="dine-in",
                 customer_name=effective_cafe_cust,
