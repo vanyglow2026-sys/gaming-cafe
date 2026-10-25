@@ -66,6 +66,9 @@ async def test_health_check_database_connectivity(test_db):
         data = res.json()
         assert data["status"] == "ok"
 
+        res_head = await client.head("/health")
+        assert res_head.status_code == 200
+
         # Test detailed /api/health diagnostic
         res_api = await client.get("/api/health")
         assert res_api.status_code == 200

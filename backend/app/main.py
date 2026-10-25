@@ -604,7 +604,7 @@ async def public_booking_create(
 
 
 
-@app.get("/health", tags=["Health"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["Health"])
 async def health_probe():
     """Lightweight, unauthenticated health probe for Render's zero-downtime health probes."""
     return {"status": "ok"}
