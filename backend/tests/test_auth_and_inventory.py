@@ -82,7 +82,7 @@ async def test_admin_login(test_db):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         res = await client.post(
             "/api/v1/auth/login",
-            json={"identifier": "admin", "password": "admin123"},
+            json={"identifier": "admin", "password": settings.ADMIN_PASSWORD},
         )
         assert res.status_code == 200
         data = res.json()
@@ -100,7 +100,7 @@ async def test_admin_login(test_db):
         # Admin login via configured ADMIN_PHONE
         phone_res = await client.post(
             "/api/v1/auth/login",
-            json={"identifier": settings.ADMIN_PHONE, "password": "admin123"},
+            json={"identifier": settings.ADMIN_PHONE, "password": settings.ADMIN_PASSWORD},
         )
         assert phone_res.status_code == 200
         assert phone_res.json()["user"]["role"] == "ADMIN"
@@ -216,7 +216,7 @@ async def test_station_food_order_atomic_stock_deduction(test_db):
         # Admin logs in to place desk orders
         admin_login = await client.post(
             "/api/v1/auth/login",
-            json={"identifier": "admin", "password": "admin123"},
+            json={"identifier": "admin", "password": settings.ADMIN_PASSWORD},
         )
         assert admin_login.status_code == 200
         admin_token = admin_login.json()["access_token"]

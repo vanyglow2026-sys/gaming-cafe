@@ -324,7 +324,17 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
 
   // Helper: focus and highlight a specific active cell
   const handleFocusActiveCell = (targetModeId: string, targetStationId: string) => {
-    const cellKey = `${targetModeId}-${targetStationId}`;
+    let cellKey = `${targetModeId}-${targetStationId}`;
+    if (!cellRefs.current[cellKey]) {
+      const matchedMode = matrixData?.modes.find(
+        (m) =>
+          m.id.toLowerCase() === targetModeId.toLowerCase() ||
+          m.name.toLowerCase() === targetModeId.toLowerCase()
+      );
+      if (matchedMode) {
+        cellKey = `${matchedMode.id}-${targetStationId}`;
+      }
+    }
     setFocusedCellKey(cellKey);
     const element = cellRefs.current[cellKey];
     if (element) {
@@ -1401,6 +1411,8 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                       const isModeMatch = isVrRow
                         ? hasActiveSession
                         : (sessionModeRaw === thisModeRaw ||
+                           (activeSession?.mode_name && mode.name && activeSession.mode_name.toLowerCase() === mode.name.toLowerCase()) ||
+                           (activeSession?.station_id && (activeSession.station_id === mode.id || activeSession.station_id.toLowerCase() === mode.name.toLowerCase())) ||
                            (thisModeRaw === 'car_sim' && sessionModeRaw.includes('car')) ||
                            (thisModeRaw === 'multiplayer' && sessionModeRaw.includes('multi')) ||
                            (thisModeRaw === 'solo' && sessionModeRaw.includes('solo')) ||
@@ -1663,7 +1675,7 @@ export const ConsoleMatrixDashboard: React.FC<ConsoleMatrixDashboardProps> = ({
                                     if (o.mode) {
                                       const ordMode = o.mode.toLowerCase();
                                       const curMode = mode.id.toLowerCase();
-                                      let match = ordMode === curMode;
+                                      let match = ordMode === curMode || (Boolean(mode.name) && ordMode === mode.name.toLowerCase());
                                       if (curMode === 'car_sim' && (ordMode.includes('car') || ordMode === 'car_sim')) match = true;
                                       if (curMode === 'multiplayer' && (ordMode.includes('multi') || ordMode === 'multiplayer')) match = true;
                                       if (curMode === 'solo' && ordMode === 'solo') match = true;

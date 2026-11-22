@@ -297,3 +297,23 @@ class AdvanceBookingRecord(Base):
         Index("ix_advance_bookings_date_station", "booking_date", "station_id"),
     )
 
+
+class Expense(Base):
+    __tablename__ = "expenses"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    date: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # YYYY-MM-DD
+    category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # cafe exp, food exp, Home exp, etc.
+    description: Mapped[str] = mapped_column(String(255), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_expenses_date_category", "date", "category"),
+    )
+
+

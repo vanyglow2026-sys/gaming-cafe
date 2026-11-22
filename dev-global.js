@@ -122,10 +122,18 @@ async function main() {
 
   // ── 1. Detect Python / venv ──────────────────────────────────────────────
   let pythonCmd = 'python';
-  const winVenv = path.join(backendDir, '.venv', 'Scripts', 'python.exe');
-  const unixVenv = path.join(backendDir, '.venv', 'bin', 'python');
-  if (fs.existsSync(winVenv)) pythonCmd = winVenv;
-  else if (fs.existsSync(unixVenv)) pythonCmd = unixVenv;
+  const venvCandidates = [
+    path.join(backendDir, 'venv', 'Scripts', 'python.exe'),
+    path.join(backendDir, '.venv', 'Scripts', 'python.exe'),
+    path.join(backendDir, 'venv', 'bin', 'python'),
+    path.join(backendDir, '.venv', 'bin', 'python'),
+  ];
+  for (const cand of venvCandidates) {
+    if (fs.existsSync(cand)) {
+      pythonCmd = cand;
+      break;
+    }
+  }
 
   // ── 2. Decide DATABASE_URL (SQLite fallback if no Postgres) ──────────────
   const env = { ...process.env, HOST: validatedEnv.HOST, PORT: String(validatedEnv.BACKEND_PORT), PYTHONPATH: backendDir };

@@ -24,7 +24,7 @@ from app.schemas.api_schemas import (
     InSeatOrderPayload,
 )
 from app.services.order_service import serialize_order, ensure_utc, CURRENCY_QUANTIZATION
-from app.services.session_service import start_category_session, _compute_time_charge
+from app.services.session_service import _compute_time_charge
 from app.services.ws_notifier import buffer_ws_event
 
 router = APIRouter(prefix="/customer", tags=["Customer Operations"])

@@ -191,9 +191,6 @@ def parse_booking_range(
         return None, None
 
 
-parse_booking_range_service = parse_booking_range
-
-
 async def _validate_no_advance_booking_conflict(
     db: AsyncSession,
     target_device: str,
@@ -227,7 +224,7 @@ async def _validate_no_advance_booking_conflict(
         if customer_name and eb.customer_name and customer_name.strip().lower() == eb.customer_name.strip().lower() and customer_name.strip().lower() not in ("gamer", "walk-in gamer"):
             continue
 
-        eb_start, eb_end = parse_booking_range_service(eb.booking_date, eb.start_time, eb.duration_minutes)
+        eb_start, eb_end = parse_booking_range(eb.booking_date, eb.start_time, eb.duration_minutes)
         if not eb_start or not eb_end:
             continue
 
@@ -857,7 +854,7 @@ async def get_fleet_categories(db: AsyncSession) -> List[Dict[str, Any]]:
             else:
                 for eb in b_records:
                     if eb.station_id.strip().upper() == dev_upper:
-                        eb_start, eb_end = parse_booking_range_service(eb.booking_date, eb.start_time, eb.duration_minutes)
+                        eb_start, eb_end = parse_booking_range(eb.booking_date, eb.start_time, eb.duration_minutes)
                         if eb_start and eb_end and eb_end > now_local:
                             diff_m = int((eb_start - now_local).total_seconds() / 60)
                             if diff_m <= 15 and diff_m >= -15:
@@ -1202,6 +1199,23 @@ async def get_fleet_matrix(db: AsyncSession) -> Dict[str, Any]:
             elif cat_id_raw == "solo":
                 mode_key = "solo"
                 mode_name = "Solo"
+            elif active_s.station and active_s.station.name.lower() in ("solo", "multiplayer", "car simulator", "vr"):
+                st_low = active_s.station.name.lower()
+                if "car" in st_low:
+                    mode_key = "car_sim"
+                    mode_name = "Car Simulator"
+                elif "multi" in st_low:
+                    mode_key = "multiplayer"
+                    mode_name = "Multiplayer"
+                elif "vr" in st_low:
+                    mode_key = "vr_sim"
+                    mode_name = "VR"
+                else:
+                    mode_key = "solo"
+                    mode_name = "Solo"
+            elif active_s.station:
+                mode_key = str(active_s.station.id)
+                mode_name = active_s.station.name
             else:
                 mode_key = cat_id_raw or "solo"
                 mode_name = active_s.station_name or "Solo"
@@ -1236,7 +1250,7 @@ async def get_fleet_matrix(db: AsyncSession) -> Dict[str, Any]:
             st_bookings = []
             for eb in b_records:
                 if eb.station_id.strip().upper() == dev_upper:
-                    eb_start, eb_end = parse_booking_range_service(eb.booking_date, eb.start_time, eb.duration_minutes)
+                    eb_start, eb_end = parse_booking_range(eb.booking_date, eb.start_time, eb.duration_minutes)
                     if eb_start and eb_end and eb_end > now_local:
                         diff_m = int((eb_start - now_local).total_seconds() / 60)
                         if diff_m >= -15:
@@ -1399,22 +1413,22 @@ async def start_category_session(
     else:
         norm_cat = raw_cat
 
+    # Query currently occupied devices across all active gaming sessions
+    # (Exclude food-only seat sessions where game time has not yet started)
+    active_dev_res = await db.execute(
+        select(Session.device_name).where(
+            Session.status == SessionStatus.ACTIVE.value,
+            Session.device_name.is_not(None),
+            or_(
+                Session.allocated_minutes > 0,
+                and_(Session.tier_price.is_not(None), Session.tier_price > Decimal("0.00")),
+            ),
+        )
+    )
+    occupied_devs = {str(d).upper() for d in active_dev_res.scalars().all() if d}
+
     if norm_cat in CATEGORY_CONFIGS:
         cat_cfg = CATEGORY_CONFIGS[norm_cat]
-
-        # Query currently occupied devices across all active gaming sessions
-        # (Exclude food-only seat sessions where game time has not yet started)
-        active_dev_res = await db.execute(
-            select(Session.device_name).where(
-                Session.status == SessionStatus.ACTIVE.value,
-                Session.device_name.is_not(None),
-                or_(
-                    Session.allocated_minutes > 0,
-                    and_(Session.tier_price.is_not(None), Session.tier_price > Decimal("0.00")),
-                ),
-            )
-        )
-        occupied_devs = {str(d).upper() for d in active_dev_res.scalars().all() if d}
 
         # Resolve target console room / device
         if norm_cat == "car_sim":
@@ -1512,7 +1526,7 @@ async def start_category_session(
         pricing_tiers_pool = station.pricing_tiers or cat_cfg["pricing_tiers"]
         fallback_hourly_rate = station.hourly_rate or cat_cfg["hourly_rate"]
     else:
-        # Custom station added by admin
+        # Custom station added by admin (e.g. GTA 6, PC1, etc.)
         custom_station = None
         try:
             cat_uuid = uuid.UUID(category_id)
@@ -1531,13 +1545,43 @@ async def start_category_session(
             )
 
         station = custom_station
-        target_device_name = station.name
 
-        # Verify station occupancy atomically
+        # Resolve target physical device (console)
+        if device_id:
+            dev_str = str(device_id).strip().upper()
+            target_device_name = dev_str
+        elif station.name.upper() in ("PS1", "PS2", "PS3", "VR1"):
+            target_device_name = station.name.upper()
+        else:
+            avail = [d for d in ["PS1", "PS2", "PS3"] if d.upper() not in occupied_devs]
+            if not avail:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"All consoles for '{station.name}' are currently occupied.",
+                )
+            target_device_name = avail[0]
+
+        # Verify device occupancy atomically: check for any active gaming session on target_device_name
+        if target_device_name.upper() in occupied_devs:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Device '{target_device_name}' currently in use.",
+            )
+
+        # Validate advance booking overlap protection
+        await _validate_no_advance_booking_conflict(
+            db=db,
+            target_device=target_device_name,
+            allocated_minutes=duration_minutes,
+            customer_name=customer_name,
+            customer_phone=customer_phone,
+        )
+
+        # Double check database row lock on existing active sessions for this device
         active_stmt = (
             select(Session)
             .where(
-                Session.station_id == station.id,
+                func.upper(Session.device_name) == target_device_name.upper(),
                 Session.status == SessionStatus.ACTIVE.value,
             )
             .options(
@@ -1552,20 +1596,11 @@ async def start_category_session(
             and active_conflict.allocated_minutes == 0
             and (active_conflict.tier_price == Decimal("0.00") or active_conflict.tier_price is None)
         )
-        if (active_conflict and not is_food_only) or (station.status == StationStatus.OCCUPIED.value and not is_food_only):
+        if active_conflict and not is_food_only:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Station '{station.name}' currently in use.",
+                detail=f"Device '{target_device_name}' currently in use.",
             )
-
-        # Validate advance booking overlap protection
-        await _validate_no_advance_booking_conflict(
-            db=db,
-            target_device=target_device_name,
-            allocated_minutes=duration_minutes,
-            customer_name=customer_name,
-            customer_phone=customer_phone,
-        )
 
         pricing_tiers_pool = station.pricing_tiers or []
         fallback_hourly_rate = station.hourly_rate or Decimal(str(settings.DEFAULT_HOURLY_RATE))

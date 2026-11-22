@@ -2,7 +2,7 @@ import uuid
 from decimal import Decimal
 from datetime import datetime
 from typing import List, Optional, Any, Union, Dict
-from pydantic import BaseModel, Field, ConfigDict, model_validator, AliasChoices
+from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator, AliasChoices
 
 from app.core.config import settings
 from app.models.enums import OrderStatus, PaymentMethod
@@ -463,3 +463,71 @@ class CustomerProfileResponse(BaseModel):
     last_visit: Optional[str] = None
     total_spent: float
     notes: Optional[str] = None
+
+
+class ExpenseCreate(BaseModel):
+    date: str  # YYYY-MM-DD
+    category: str
+    description: str
+    amount: Decimal
+
+    @field_validator("amount")
+    @classmethod
+    def validate_amount(cls, v: Decimal) -> Decimal:
+        if v < 0:
+            raise ValueError("Expense amount cannot be negative")
+        return v
+
+
+class ExpenseUpdate(BaseModel):
+    date: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    amount: Optional[Decimal] = None
+
+    @field_validator("amount")
+    @classmethod
+    def validate_amount(cls, v: Optional[Decimal]) -> Optional[Decimal]:
+        if v is not None and v < 0:
+            raise ValueError("Expense amount cannot be negative")
+        return v
+
+
+class ExpenseResponse(BaseModel):
+    id: uuid.UUID
+    date: str
+    category: str
+    description: str
+    amount: float
+    created_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class FinancialPeriodSummary(BaseModel):
+    revenue: float
+    expenditures: float
+    profit: float
+
+
+class CategoryExpenseBreakdown(BaseModel):
+    category: str
+    amount: float
+    percentage: float
+
+
+class ExpenseInsights(BaseModel):
+    totalExpenses: float
+    activeExpenseCount: int
+    averageExpense: float
+    highestExpense: float
+    foodExpenseShare: float
+    utilitiesRentShare: float
+
+
+class FinancialDashboardResponse(BaseModel):
+    financialSummary: Dict[str, FinancialPeriodSummary]
+    categoryBreakdown: List[CategoryExpenseBreakdown]
+    insights: ExpenseInsights
+    expenses: List[ExpenseResponse]
+

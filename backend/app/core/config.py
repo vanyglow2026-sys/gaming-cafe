@@ -61,7 +61,13 @@ class Settings(BaseSettings):
 
     @property
     def cors_origin_list(self) -> List[str]:
-        target = self.ALLOWED_ORIGINS if self.ALLOWED_ORIGINS is not None else self.CORS_ORIGINS
+        if "CORS_ORIGINS" in self.model_fields_set:
+            target: Union[str, List[str]] = self.CORS_ORIGINS
+        elif self.ALLOWED_ORIGINS is not None:
+            target = self.ALLOWED_ORIGINS
+        else:
+            target = self.CORS_ORIGINS
+
         if isinstance(target, list):
             return target
         if isinstance(target, str):

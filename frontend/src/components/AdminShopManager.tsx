@@ -1,21 +1,15 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  ShoppingBag,
   Plus,
   Minus,
-  Gamepad2,
   Trash2,
   Edit2,
   XCircle,
   TrendingUp,
   Package,
-  ArrowUpRight,
-  Clock,
   Search,
-  Banknote,
-  QrCode,
-  CreditCard,
+  Receipt,
 } from 'lucide-react';
 import {
   fetchAdminMenuItems,
@@ -23,25 +17,13 @@ import {
   updateMenuItemApi,
   deleteMenuItemApi,
   restockMenuItemApi,
-  fetchRevenueAnalyticsApi,
+  fetchFinancialDashboardApi,
+  createExpenseApi,
+  deleteExpenseApi,
 } from '../api';
-import { MenuItem, RevenueAnalyticsSummary } from '../types';
+import { MenuItem, FinancialDashboardData } from '../types';
 import { POLL_INTERVALS, evaluateStockStatus, StockStatusType } from '../constants';
 import { useNotificationStore } from '../store/notificationStore';
-
-const defaultRevenueSummary: RevenueAnalyticsSummary = {
-  totalRevenue: 0,
-  gamingRevenue: 0,
-  foodRevenue: 0,
-  cashRevenue: 0,
-  upiRevenue: 0,
-  cashCount: 0,
-  upiCount: 0,
-  sessionsCount: 0,
-  averageSessionBill: 0,
-  topSellingItem: 'None',
-  chartData: [],
-};
 
 export const AdminShopManager: React.FC = () => {
   const queryClient = useQueryClient();
@@ -96,7 +78,6 @@ export const AdminShopManager: React.FC = () => {
   });
 
   const [activeTab, setActiveTab] = useState<'INVENTORY' | 'REVENUE'>('INVENTORY');
-  const [revenuePeriod, setRevenuePeriod] = useState<'DAY' | 'WEEK' | 'MONTH'>('DAY');
 
   // Search & Status Filters for Remade Inventory Table
   const [searchQuery, setSearchQuery] = useState('');
@@ -176,12 +157,65 @@ export const AdminShopManager: React.FC = () => {
     });
   };
 
-  // Real-time Revenue metrics directly aggregated from SQLite DB
-  const { data: revenueData = defaultRevenueSummary } = useQuery<RevenueAnalyticsSummary>({
-    queryKey: ['admin-revenue-analytics', revenuePeriod],
-    queryFn: () => fetchRevenueAnalyticsApi(revenuePeriod),
+  // Financial Dashboard & Expenditure Logger State
+  const todayIsoString = new Date().toISOString().slice(0, 10);
+  const [expDate, setExpDate] = useState<string>(todayIsoString);
+  const [expCategory, setExpCategory] = useState<string>('cafe exp');
+  const [expCustomCategory, setExpCustomCategory] = useState<string>('');
+  const [expDescription, setExpDescription] = useState<string>('');
+  const [expAmount, setExpAmount] = useState<string>('');
+
+  const { data: finDashboard } = useQuery<FinancialDashboardData>({
+    queryKey: ['financial-dashboard'],
+    queryFn: fetchFinancialDashboardApi,
     refetchInterval: 8000,
   });
+
+  const createExpenseMutation = useMutation({
+    mutationFn: createExpenseApi,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['financial-dashboard'] });
+      setExpDescription('');
+      setExpAmount('');
+      setExpCustomCategory('');
+      addNotification('FOOD_ORDER', '✅ Expense Recorded', 'Expenditure entry logged successfully.');
+    },
+    onError: (err: any) => {
+      addNotification('FOOD_ORDER', '⚠️ Expense Error', err.message || 'Failed to record expense.');
+    },
+  });
+
+  const deleteExpenseMutation = useMutation({
+    mutationFn: deleteExpenseApi,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['financial-dashboard'] });
+      addNotification('FOOD_ORDER', '🗑️ Expense Removed', 'Expense item deleted successfully.');
+    },
+    onError: (err: any) => {
+      addNotification('FOOD_ORDER', '⚠️ Delete Failed', err.message || 'Could not delete expense.');
+    },
+  });
+
+  const handleAddExpense = (e: React.FormEvent) => {
+    e.preventDefault();
+    const finalCat = expCategory === '__CUSTOM__' ? expCustomCategory.trim() : expCategory.trim();
+    const parsedAmount = parseFloat(expAmount);
+    if (!finalCat || isNaN(parsedAmount) || parsedAmount <= 0) {
+      addNotification('FOOD_ORDER', '⚠️ Invalid Input', 'Please provide a valid category and expense amount.');
+      return;
+    }
+    createExpenseMutation.mutate({
+      date: expDate || todayIsoString,
+      category: finalCat,
+      description: expDescription.trim() || 'General Expense',
+      amount: parsedAmount,
+    });
+  };
+
+  const formatINR = (val: number | undefined | null) => {
+    const num = Math.round(Number(val || 0));
+    return '₹' + num.toLocaleString('en-IN');
+  };
 
   return (
     <div className="space-y-6 relative z-10">
@@ -426,290 +460,357 @@ export const AdminShopManager: React.FC = () => {
       )}
 
       {/* ========================================================================= */}
-      {/* REVENUE ANALYTICS TAB */}
+      {/* REVENUE ANALYTICS TAB: REDESIGNED SPREADSHEET FINANCIAL DASHBOARD */}
       {/* ========================================================================= */}
       {activeTab === 'REVENUE' && (
         <div className="space-y-6">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#FFFFFF] p-4 rounded-2xl border border-[#E2E8F0] shadow-xs">
-            <div>
-              <h3 className="text-base sm:text-lg font-bold text-[#172554] font-display flex items-center gap-2">
-                <TrendingUp className="w-5 h-5 text-[#EA580C]" />
-                <span>Financial Performance & Revenue Dashboard</span>
-              </h3>
-              <p className="text-xs text-[#64748B] font-sans mt-0.5">
-                Track gaming console income, cafe food revenue, and player transaction history.
-              </p>
-            </div>
-
-            <div className="inline-flex p-1 bg-[#FFF7ED] rounded-xl border border-[#E2E8F0]">
-              <button
-                onClick={() => setRevenuePeriod('DAY')}
-                className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  revenuePeriod === 'DAY'
-                    ? 'bg-[#172554] text-white shadow-xs'
-                    : 'text-[#64748B] hover:text-[#0F172A]'
-                }`}
-              >
-                Today (Day)
-              </button>
-              <button
-                onClick={() => setRevenuePeriod('WEEK')}
-                className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  revenuePeriod === 'WEEK'
-                    ? 'bg-[#172554] text-white shadow-xs'
-                    : 'text-[#64748B] hover:text-[#0F172A]'
-                }`}
-              >
-                This Week
-              </button>
-              <button
-                onClick={() => setRevenuePeriod('MONTH')}
-                className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                  revenuePeriod === 'MONTH'
-                    ? 'bg-[#172554] text-white shadow-xs'
-                    : 'text-[#64748B] hover:text-[#0F172A]'
-                }`}
-              >
-                This Month
-              </button>
-            </div>
+          {/* Main Top Banner matching user spreadsheet */}
+          <div className="bg-[#1E3A8A] text-white py-3.5 px-6 rounded-2xl shadow-md text-center border border-[#1E40AF]">
+            <h2 className="text-lg sm:text-xl md:text-2xl font-black font-display tracking-wider uppercase">
+              Gaming Cafe Manager — Revenue &amp; Profit Dashboard
+            </h2>
           </div>
 
-          {/* 4 Financial KPI Cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <div className="bg-[#FFFFFF] p-5 rounded-2xl border border-[#E2E8F0] shadow-xs space-y-2">
-              <div className="flex items-center justify-between text-[#64748B] text-xs font-semibold">
-                <span>Total Gross Revenue</span>
-                <span className="p-1.5 rounded-lg bg-[#EFF6FF] text-[#172554] font-bold">₹</span>
+          {/* 4-Quadrant Financial Dashboard Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+            {/* QUADRANT 1: FINANCIAL SUMMARY */}
+            <div className="bg-[#FFFFFF] rounded-2xl border border-[#CBD5E1] shadow-xs overflow-hidden flex flex-col">
+              <div className="bg-[#1E3A8A] text-white font-bold text-center py-2.5 px-4 text-xs sm:text-sm tracking-wider uppercase font-display">
+                FINANCIAL SUMMARY
               </div>
-              <div className="text-2xl sm:text-3xl font-black text-[#172554] font-mono-code">
-                ₹{revenueData.totalRevenue.toFixed(2)}
-              </div>
-              <div className="text-[11px] text-[#15803D] font-semibold flex items-center gap-1">
-                <ArrowUpRight className="w-3.5 h-3.5" />
-                <span>100% Zero-Drift Financials</span>
+              <div className="overflow-x-auto flex-1">
+                <table className="w-full text-xs sm:text-sm text-left border-collapse">
+                  <thead>
+                    <tr className="bg-[#2D4A8A] text-white font-semibold">
+                      <th className="py-2.5 px-3 border border-[#475569]/30">Period</th>
+                      <th className="py-2.5 px-3 border border-[#475569]/30 text-right">Revenue</th>
+                      <th className="py-2.5 px-3 border border-[#475569]/30 text-right">Total Expenditures</th>
+                      <th className="py-2.5 px-3 border border-[#475569]/30 text-right">Final Profit</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#E2E8F0] font-sans">
+                    <tr className="hover:bg-[#F8FAFC]">
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] font-medium text-[#1E293B]">
+                        Today / Daily
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#0F172A]">
+                        {formatINR(finDashboard?.financialSummary.today.revenue)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#B91C1C]">
+                        {formatINR(finDashboard?.financialSummary.today.expenditures)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code font-bold text-[#15803D]">
+                        {formatINR(finDashboard?.financialSummary.today.profit)}
+                      </td>
+                    </tr>
+                    <tr className="hover:bg-[#F8FAFC]">
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] font-medium text-[#1E293B]">
+                        This Week / Weekly
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#0F172A]">
+                        {formatINR(finDashboard?.financialSummary.weekly.revenue)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#B91C1C]">
+                        {formatINR(finDashboard?.financialSummary.weekly.expenditures)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code font-bold text-[#15803D]">
+                        {formatINR(finDashboard?.financialSummary.weekly.profit)}
+                      </td>
+                    </tr>
+                    <tr className="hover:bg-[#F8FAFC]">
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] font-medium text-[#1E293B]">
+                        This Month / Monthly
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#0F172A]">
+                        {formatINR(finDashboard?.financialSummary.monthly.revenue)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#B91C1C]">
+                        {formatINR(finDashboard?.financialSummary.monthly.expenditures)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#E2E8F0] text-right font-mono-code font-bold text-[#15803D]">
+                        {formatINR(finDashboard?.financialSummary.monthly.profit)}
+                      </td>
+                    </tr>
+                    <tr className="bg-[#EEF2FF] font-bold">
+                      <td className="py-2.5 px-3 border border-[#C7D2FE] text-[#1E3A8A]">
+                        All-Time Total
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#C7D2FE] text-right font-mono-code text-[#1E3A8A]">
+                        {formatINR(finDashboard?.financialSummary.allTime.revenue)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#C7D2FE] text-right font-mono-code text-[#B91C1C]">
+                        {formatINR(finDashboard?.financialSummary.allTime.expenditures)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#C7D2FE] text-right font-mono-code text-[#15803D]">
+                        {formatINR(finDashboard?.financialSummary.allTime.profit)}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
 
-            <div className="bg-[#FFFFFF] p-5 rounded-2xl border border-[#E2E8F0] shadow-xs space-y-2">
-              <div className="flex items-center justify-between text-[#64748B] text-xs font-semibold">
-                <span>Console Gaming Income</span>
-                <Gamepad2 className="w-4 h-4 text-[#15803D]" />
+            {/* QUADRANT 2: CATEGORY EXPENSE BREAKDOWN */}
+            <div className="bg-[#FFFFFF] rounded-2xl border border-[#CBD5E1] shadow-xs overflow-hidden flex flex-col">
+              <div className="bg-[#1E3A8A] text-white font-bold text-center py-2.5 px-4 text-xs sm:text-sm tracking-wider uppercase font-display">
+                CATEGORY EXPENSE BREAKDOWN
               </div>
-              <div className="text-2xl sm:text-3xl font-black text-[#15803D] font-mono-code">
-                ₹{revenueData.gamingRevenue.toFixed(2)}
-              </div>
-              <div className="text-[11px] text-[#64748B] font-mono-code">
-                {((revenueData.gamingRevenue / (revenueData.totalRevenue || 1)) * 100).toFixed(0)}% of total revenue
+              <div className="overflow-x-auto flex-1">
+                <table className="w-full text-xs sm:text-sm text-left border-collapse">
+                  <thead>
+                    <tr className="bg-[#2D4A8A] text-white font-semibold">
+                      <th className="py-2.5 px-3 border border-[#475569]/30">Category</th>
+                      <th className="py-2.5 px-3 border border-[#475569]/30 text-right">Total Amount</th>
+                      <th className="py-2.5 px-3 border border-[#475569]/30 text-right">% of Total</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#E2E8F0] font-sans">
+                    {(finDashboard?.categoryBreakdown || []).map((cat, idx) => (
+                      <tr key={idx} className="hover:bg-[#F8FAFC]">
+                        <td className="py-2 px-3 border border-[#E2E8F0] font-medium text-[#1E293B]">
+                          {cat.category}
+                        </td>
+                        <td className="py-2 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#0F172A]">
+                          {formatINR(cat.amount)}
+                        </td>
+                        <td className="py-2 px-3 border border-[#E2E8F0] text-right font-mono-code text-[#64748B]">
+                          {cat.percentage.toFixed(1)}%
+                        </td>
+                      </tr>
+                    ))}
+                    {(!finDashboard?.categoryBreakdown || finDashboard.categoryBreakdown.length === 0) && (
+                      <tr>
+                        <td colSpan={3} className="py-4 text-center text-[#94A3B8] italic">
+                          No categorized expenses logged yet
+                        </td>
+                      </tr>
+                    )}
+                    <tr className="bg-[#EEF2FF] font-bold">
+                      <td className="py-2.5 px-3 border border-[#C7D2FE] text-[#1E3A8A]">
+                        Total Expenditures
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#C7D2FE] text-right font-mono-code text-[#B91C1C]">
+                        {formatINR(finDashboard?.insights.totalExpenses)}
+                      </td>
+                      <td className="py-2.5 px-3 border border-[#C7D2FE] text-right font-mono-code text-[#1E3A8A]">
+                        100.0%
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
 
-            <div className="bg-[#FFFFFF] p-5 rounded-2xl border border-[#E2E8F0] shadow-xs space-y-2">
-              <div className="flex items-center justify-between text-[#64748B] text-xs font-semibold">
-                <span>Cafe & Food Sales</span>
-                <ShoppingBag className="w-4 h-4 text-[#EA580C]" />
+            {/* QUADRANT 3: EDITABLE EXPENSE LOG */}
+            <div className="bg-[#FFFFFF] rounded-2xl border border-[#CBD5E1] shadow-xs overflow-hidden flex flex-col">
+              <div className="bg-[#1E3A8A] text-white font-bold text-center py-2.5 px-4 text-xs sm:text-sm tracking-wider uppercase font-display">
+                EDITABLE EXPENSE LOG
               </div>
-              <div className="text-2xl sm:text-3xl font-black text-[#EA580C] font-mono-code">
-                ₹{revenueData.foodRevenue.toFixed(2)}
-              </div>
-              <div className="text-[11px] text-[#64748B] font-mono-code">
-                {((revenueData.foodRevenue / (revenueData.totalRevenue || 1)) * 100).toFixed(0)}% of total revenue
-              </div>
-            </div>
 
-            <div className="bg-[#FFFFFF] p-5 rounded-2xl border border-[#E2E8F0] shadow-xs space-y-2">
-              <div className="flex items-center justify-between text-[#64748B] text-xs font-semibold">
-                <span>Completed Sessions</span>
-                <Clock className="w-4 h-4 text-[#64748B]" />
-              </div>
-              <div className="text-2xl sm:text-3xl font-black text-[#172554] font-mono-code">
-                {revenueData.sessionsCount}
-              </div>
-              <div className="text-[11px] text-[#64748B] font-mono-code">
-                Avg: ₹{revenueData.averageSessionBill.toFixed(0)} / session
-              </div>
-            </div>
-          </div>
-
-          {/* ========================================================================= */}
-          {/* DEDICATED PAYMENT METHOD COLLECTION BOXES (CASH & UPI/QR) */}
-          {/* ========================================================================= */}
-          <div className="bg-[#FFFFFF] p-5 sm:p-6 rounded-2xl border border-[#E2E8F0] shadow-xs space-y-5">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[#F1F5F9]">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 rounded-xl bg-[#EFF6FF] text-[#1D4ED8]">
-                  <CreditCard className="w-5 h-5 text-[#1D4ED8]" />
+              {/* Quick Input Bar to Log New Expense */}
+              <form onSubmit={handleAddExpense} className="p-3 bg-[#F8FAFC] border-b border-[#E2E8F0] space-y-2">
+                <div className="text-[11px] font-bold text-[#475569] uppercase tracking-wider flex items-center gap-1.5">
+                  <Receipt className="w-3.5 h-3.5 text-[#EA580C]" />
+                  <span>Log New Expenditure</span>
                 </div>
-                <div>
-                  <h4 className="text-sm sm:text-base font-bold text-[#0F172A] font-display flex items-center gap-2">
-                    <span>Payment Mode Collections</span>
-                    <span className="text-[11px] font-mono-code font-semibold px-2 py-0.5 rounded-full bg-[#F1F5F9] text-[#475569] border border-[#E2E8F0]">
-                      Settlement Audit
+                <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                  <div className="sm:col-span-3">
+                    <input
+                      type="date"
+                      value={expDate}
+                      onChange={(e) => setExpDate(e.target.value)}
+                      className="w-full px-2.5 py-1.5 bg-white border border-[#CBD5E1] rounded-lg text-xs font-mono-code text-[#0F172A] focus:outline-none focus:border-[#1E3A8A]"
+                      required
+                    />
+                  </div>
+                  <div className="sm:col-span-3">
+                    <select
+                      value={expCategory}
+                      onChange={(e) => setExpCategory(e.target.value)}
+                      className="w-full px-2.5 py-1.5 bg-white border border-[#CBD5E1] rounded-lg text-xs text-[#0F172A] focus:outline-none focus:border-[#1E3A8A]"
+                    >
+                      <option value="cafe exp">cafe exp</option>
+                      <option value="food exp">food exp</option>
+                      <option value="Home exp">Home exp</option>
+                      <option value="mis. exp">mis. exp</option>
+                      <option value="Food">Food</option>
+                      <option value="Electricity">Electricity</option>
+                      <option value="Rent">Rent</option>
+                      <option value="Other Miscellaneous">Other Miscellaneous</option>
+                      <option value="Staff Salaries">Staff Salaries</option>
+                      <option value="Maintenance">Maintenance</option>
+                      <option value="__CUSTOM__">+ Custom Category...</option>
+                    </select>
+                  </div>
+                  {expCategory === '__CUSTOM__' && (
+                    <div className="sm:col-span-12">
+                      <input
+                        type="text"
+                        value={expCustomCategory}
+                        onChange={(e) => setExpCustomCategory(e.target.value)}
+                        placeholder="Type category name (e.g. WiFi, Marketing)"
+                        className="w-full px-2.5 py-1.5 bg-white border border-[#CBD5E1] rounded-lg text-xs text-[#0F172A] focus:outline-none focus:border-[#1E3A8A]"
+                        required
+                      />
+                    </div>
+                  )}
+                  <div className="sm:col-span-3">
+                    <input
+                      type="text"
+                      value={expDescription}
+                      onChange={(e) => setExpDescription(e.target.value)}
+                      placeholder="Description (e.g. milk)"
+                      className="w-full px-2.5 py-1.5 bg-white border border-[#CBD5E1] rounded-lg text-xs text-[#0F172A] focus:outline-none focus:border-[#1E3A8A]"
+                      required
+                    />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <input
+                      type="number"
+                      step="any"
+                      min="1"
+                      value={expAmount}
+                      onChange={(e) => setExpAmount(e.target.value)}
+                      placeholder="₹ Amount"
+                      className="w-full px-2.5 py-1.5 bg-white border border-[#CBD5E1] rounded-lg text-xs font-mono-code text-[#0F172A] focus:outline-none focus:border-[#1E3A8A]"
+                      required
+                    />
+                  </div>
+                  <div className="sm:col-span-1">
+                    <button
+                      type="submit"
+                      disabled={createExpenseMutation.isPending}
+                      className="w-full h-full py-1.5 px-2 bg-[#1E3A8A] hover:bg-[#1E40AF] text-white rounded-lg text-xs font-bold transition-all shadow-xs flex items-center justify-center cursor-pointer disabled:opacity-50"
+                      title="Add Expense"
+                    >
+                      <Plus className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              </form>
+
+              {/* Scrollable Spreadsheet Table */}
+              <div className="overflow-x-auto max-h-72 overflow-y-auto flex-1">
+                <table className="w-full text-xs sm:text-sm text-left border-collapse">
+                  <thead className="sticky top-0 z-10 shadow-xs">
+                    <tr className="bg-[#2D4A8A] text-white font-semibold">
+                      <th className="py-2 px-3 border border-[#475569]/30">Date</th>
+                      <th className="py-2 px-3 border border-[#475569]/30">Category</th>
+                      <th className="py-2 px-3 border border-[#475569]/30">Description</th>
+                      <th className="py-2 px-3 border border-[#475569]/30 text-right">Amount</th>
+                      <th className="py-2 px-2 border border-[#475569]/30 text-center w-10"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#E2E8F0] font-sans">
+                    {(finDashboard?.expenses || []).map((exp) => (
+                      <tr key={exp.id} className="hover:bg-[#F8FAFC]">
+                        <td className="py-2 px-3 border border-[#E2E8F0] font-mono-code text-[#475569] whitespace-nowrap">
+                          {exp.date}
+                        </td>
+                        <td className="py-2 px-3 border border-[#E2E8F0] font-medium text-[#1E293B]">
+                          <span className="px-2 py-0.5 rounded-md bg-[#F1F5F9] text-[#334155] border border-[#CBD5E1] text-[11px] font-mono-code">
+                            {exp.category}
+                          </span>
+                        </td>
+                        <td className="py-2 px-3 border border-[#E2E8F0] text-[#0F172A]">
+                          {exp.description}
+                        </td>
+                        <td className="py-2 px-3 border border-[#E2E8F0] text-right font-mono-code font-bold text-[#0F172A]">
+                          {formatINR(exp.amount)}
+                        </td>
+                        <td className="py-2 px-2 border border-[#E2E8F0] text-center">
+                          <button
+                            type="button"
+                            onClick={() => deleteExpenseMutation.mutate(exp.id)}
+                            className="p-1 text-[#94A3B8] hover:text-[#DC2626] rounded transition-colors cursor-pointer"
+                            title="Delete Expense"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {(!finDashboard?.expenses || finDashboard.expenses.length === 0) && (
+                      <tr>
+                        <td colSpan={5} className="py-6 text-center text-[#94A3B8] italic">
+                          No expenses logged yet. Use the form above to add an expense entry.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* QUADRANT 4: EXPENSE INSIGHTS & SUMMARY */}
+            <div className="bg-[#FFFFFF] rounded-2xl border border-[#CBD5E1] shadow-xs overflow-hidden flex flex-col justify-between">
+              <div>
+                <div className="bg-[#1E3A8A] text-white font-bold text-center py-2.5 px-4 text-xs sm:text-sm tracking-wider uppercase font-display">
+                  EXPENSE INSIGHTS &amp; SUMMARY
+                </div>
+
+                <div className="p-4 space-y-3 font-sans">
+                  <div className="flex items-center justify-between py-2 border-b border-[#F1F5F9]">
+                    <span className="text-xs sm:text-sm font-semibold text-[#1E293B]">
+                      Total Logged Expenses
                     </span>
-                  </h4>
-                  <p className="text-xs text-[#64748B] font-sans mt-0.5">
-                    Real-time split of physical cash counter drawer vs digital instant UPI / QR settlements.
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <div className="text-xs font-mono-code text-[#475569] bg-[#F8FAFC] px-3.5 py-1.5 rounded-xl border border-[#E2E8F0] flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-[#15803D] animate-pulse"></span>
-                  <span>Total Settled: <strong className="text-[#0F172A] font-bold">₹{revenueData.totalRevenue.toFixed(2)}</strong></span>
-                </div>
-              </div>
-            </div>
-
-            {/* Two Dedicated Collection Boxes: CASH & UPI/QR */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* CASH COLLECTION BOX */}
-              <div className="relative overflow-hidden rounded-2xl border-2 border-[#16A34A]/30 bg-gradient-to-br from-[#F0FDF4] via-[#FFFFFF] to-[#DCFCE7]/40 p-5 shadow-xs transition-all hover:shadow-md hover:border-[#16A34A]/50">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="w-12 h-12 rounded-2xl bg-[#16A34A] text-white flex items-center justify-center shadow-sm">
-                      <Banknote className="w-6 h-6" />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-base font-bold text-[#14532D] font-display tracking-tight">
-                          Cash Collection Box
-                        </span>
-                        <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-md bg-[#DCFCE7] text-[#15803D] border border-[#BBF7D0]">
-                          Physical Till
-                        </span>
-                      </div>
-                      <p className="text-xs text-[#166534]/80 font-sans mt-0.5">
-                        Counter Cash Drawer & Hand-to-Hand Paper Currency
-                      </p>
-                    </div>
+                    <span className="text-sm sm:text-base font-black font-mono-code text-[#0F172A]">
+                      {formatINR(finDashboard?.insights.totalExpenses)}
+                    </span>
                   </div>
-                </div>
 
-                <div className="mt-4 flex items-baseline justify-between">
-                  <div className="text-2xl sm:text-3xl font-black text-[#14532D] font-mono-code tracking-tight">
-                    ₹{revenueData.cashRevenue.toFixed(2)}
+                  <div className="flex items-center justify-between py-2 border-b border-[#F1F5F9]">
+                    <span className="text-xs sm:text-sm text-[#475569]">
+                      Active Expense Count
+                    </span>
+                    <span className="text-xs sm:text-sm font-mono-code font-bold text-[#0F172A]">
+                      {finDashboard?.insights.activeExpenseCount ?? 0}
+                    </span>
                   </div>
-                  <div className="text-xs font-mono-code font-bold px-2.5 py-1 rounded-lg bg-[#DCFCE7] text-[#15803D] border border-[#BBF7D0]">
-                    {revenueData.totalRevenue > 0
-                      ? ((revenueData.cashRevenue / revenueData.totalRevenue) * 100).toFixed(1)
-                      : '0.0'}% of total
-                  </div>
-                </div>
 
-                {/* Progress Bar & Settlement Counts */}
-                <div className="mt-3.5 space-y-1.5">
-                  <div className="w-full bg-[#DCFCE7] rounded-full h-2.5 overflow-hidden">
-                    <div
-                      className="bg-[#16A34A] h-full rounded-full transition-all duration-500"
-                      style={{
-                        width: `${
-                          revenueData.totalRevenue > 0
-                            ? Math.min(100, (revenueData.cashRevenue / revenueData.totalRevenue) * 100)
-                            : 0
-                        }%`,
-                      }}
-                    />
+                  <div className="flex items-center justify-between py-2 border-b border-[#F1F5F9]">
+                    <span className="text-xs sm:text-sm text-[#475569]">
+                      Average Expense Amount
+                    </span>
+                    <span className="text-xs sm:text-sm font-mono-code font-bold text-[#0F172A]">
+                      {formatINR(finDashboard?.insights.averageExpense)}
+                    </span>
                   </div>
-                  <div className="flex items-center justify-between text-[11px] text-[#166534] font-mono-code">
-                    <span className="font-semibold">{revenueData.cashCount} Cash Settlement{revenueData.cashCount === 1 ? '' : 's'}</span>
-                    <span>Ready for Drawer Count</span>
+
+                  <div className="flex items-center justify-between py-2 border-b border-[#F1F5F9]">
+                    <span className="text-xs sm:text-sm text-[#475569]">
+                      Highest Single Expense
+                    </span>
+                    <span className="text-xs sm:text-sm font-mono-code font-bold text-[#B91C1C]">
+                      {formatINR(finDashboard?.insights.highestExpense)}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between py-2 border-b border-[#F1F5F9]">
+                    <span className="text-xs sm:text-sm text-[#475569]">
+                      Food Expense Share
+                    </span>
+                    <span className="text-xs sm:text-sm font-mono-code font-semibold text-[#0F172A]">
+                      {(finDashboard?.insights.foodExpenseShare || 0).toFixed(1)}%
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between py-2 border-b border-[#F1F5F9]">
+                    <span className="text-xs sm:text-sm text-[#475569]">
+                      Utilities &amp; Rent Share
+                    </span>
+                    <span className="text-xs sm:text-sm font-mono-code font-semibold text-[#0F172A]">
+                      {(finDashboard?.insights.utilitiesRentShare || 0).toFixed(1)}%
+                    </span>
                   </div>
                 </div>
               </div>
 
-              {/* UPI / QR COLLECTION BOX */}
-              <div className="relative overflow-hidden rounded-2xl border-2 border-[#6366F1]/30 bg-gradient-to-br from-[#EEF2FF] via-[#FFFFFF] to-[#E0E7FF]/50 p-5 shadow-xs transition-all hover:shadow-md hover:border-[#6366F1]/50">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="w-12 h-12 rounded-2xl bg-[#4F46E5] text-white flex items-center justify-center shadow-sm">
-                      <QrCode className="w-6 h-6" />
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-base font-bold text-[#312E81] font-display tracking-tight">
-                          UPI / QR Collection Box
-                        </span>
-                        <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-md bg-[#E0E7FF] text-[#4338CA] border border-[#C7D2FE]">
-                          Instant UPI / QR
-                        </span>
-                      </div>
-                      <p className="text-xs text-[#3730A3]/80 font-sans mt-0.5">
-                        Dynamic QR Scan, GPay, PhonePe, Paytm, BHIM UPI
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-4 flex items-baseline justify-between">
-                  <div className="text-2xl sm:text-3xl font-black text-[#312E81] font-mono-code tracking-tight">
-                    ₹{revenueData.upiRevenue.toFixed(2)}
-                  </div>
-                  <div className="text-xs font-mono-code font-bold px-2.5 py-1 rounded-lg bg-[#E0E7FF] text-[#4338CA] border border-[#C7D2FE]">
-                    {revenueData.totalRevenue > 0
-                      ? ((revenueData.upiRevenue / revenueData.totalRevenue) * 100).toFixed(1)
-                      : '0.0'}% of total
-                  </div>
-                </div>
-
-                {/* Progress Bar & Settlement Counts */}
-                <div className="mt-3.5 space-y-1.5">
-                  <div className="w-full bg-[#E0E7FF] rounded-full h-2.5 overflow-hidden">
-                    <div
-                      className="bg-[#4F46E5] h-full rounded-full transition-all duration-500"
-                      style={{
-                        width: `${
-                          revenueData.totalRevenue > 0
-                            ? Math.min(100, (revenueData.upiRevenue / revenueData.totalRevenue) * 100)
-                            : 0
-                        }%`,
-                      }}
-                    />
-                  </div>
-                  <div className="flex items-center justify-between text-[11px] text-[#3730A3] font-mono-code">
-                    <span className="font-semibold">{revenueData.upiCount} Digital Settlement{revenueData.upiCount === 1 ? '' : 's'}</span>
-                    <span>Bank VPA Direct Credit</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Payment Distribution Ratio Stacked Bar */}
-            <div className="pt-2">
-              <div className="flex items-center justify-between text-xs font-mono-code pb-1.5">
-                <span className="text-[#64748B] font-medium">Payment Mode Ratio (Cash vs UPI/QR)</span>
-                <div className="flex items-center gap-3">
-                  <span className="flex items-center gap-1.5 text-[#15803D] font-bold">
-                    <span className="w-2.5 h-2.5 rounded bg-[#16A34A]"></span> Cash: ₹{revenueData.cashRevenue.toFixed(2)}
-                  </span>
-                  <span className="flex items-center gap-1.5 text-[#4338CA] font-bold">
-                    <span className="w-2.5 h-2.5 rounded bg-[#4F46E5]"></span> UPI / QR: ₹{revenueData.upiRevenue.toFixed(2)}
-                  </span>
-                </div>
-              </div>
-              <div className="w-full bg-[#F1F5F9] rounded-full h-3 flex overflow-hidden">
-                <div
-                  className="bg-[#16A34A] h-full transition-all duration-500"
-                  style={{
-                    width: `${
-                      revenueData.totalRevenue > 0
-                        ? (revenueData.cashRevenue / revenueData.totalRevenue) * 100
-                        : 0
-                    }%`,
-                  }}
-                  title={`Cash: ₹${revenueData.cashRevenue.toFixed(2)}`}
-                />
-                <div
-                  className="bg-[#4F46E5] h-full transition-all duration-500"
-                  style={{
-                    width: `${
-                      revenueData.totalRevenue > 0
-                        ? (revenueData.upiRevenue / revenueData.totalRevenue) * 100
-                        : 0
-                    }%`,
-                  }}
-                  title={`UPI / QR: ₹${revenueData.upiRevenue.toFixed(2)}`}
-                />
+              {/* Instructional Note matching screenshot */}
+              <div className="p-3.5 bg-[#F8FAFC] border-t border-[#E2E8F0]">
+                <p className="text-[11px] sm:text-xs text-[#64748B] italic leading-relaxed">
+                  <strong>Instructions:</strong> Enter Date (YYYY-MM-DD), select Category from dropdown, enter Description &amp; Amount. Summary tables and KPIs update in real time.
+                </p>
               </div>
             </div>
           </div>

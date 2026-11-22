@@ -11,6 +11,8 @@ import {
   CategoryAvailability,
   SessionStartPayload,
   StationMatrixData,
+  ExpenseItem,
+  FinancialDashboardData,
 } from './types';
 
 import { useAuthStore } from './store/authStore';
@@ -541,6 +543,71 @@ export async function fetchRevenueAnalyticsApi(
     topSellingItem: 'None',
     chartData: [],
   });
+}
+
+// ---------------------------------------------------------------------------
+// Real Database Financial Dashboard & Expenditure Logging
+// ---------------------------------------------------------------------------
+export async function fetchFinancialDashboardApi(): Promise<FinancialDashboardData> {
+  const res = await safeFetch(`${API_BASE}/admin/analytics/financial-dashboard`);
+  return handleResponse<FinancialDashboardData>(res, {
+    financialSummary: {
+      today: { revenue: 0, expenditures: 0, profit: 0 },
+      weekly: { revenue: 0, expenditures: 0, profit: 0 },
+      monthly: { revenue: 0, expenditures: 0, profit: 0 },
+      allTime: { revenue: 0, expenditures: 0, profit: 0 },
+    },
+    categoryBreakdown: [],
+    insights: {
+      totalExpenses: 0,
+      activeExpenseCount: 0,
+      averageExpense: 0,
+      highestExpense: 0,
+      foodExpenseShare: 0,
+      utilitiesRentShare: 0,
+    },
+    expenses: [],
+  });
+}
+
+export async function createExpenseApi(data: {
+  date: string;
+  category: string;
+  description: string;
+  amount: number;
+}): Promise<ExpenseItem> {
+  const res = await safeFetch(`${API_BASE}/admin/expenses`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return handleResponse<ExpenseItem>(res);
+}
+
+export async function updateExpenseApi(
+  id: string,
+  data: Partial<{
+    date: string;
+    category: string;
+    description: string;
+    amount: number;
+  }>
+): Promise<ExpenseItem> {
+  const res = await safeFetch(`${API_BASE}/admin/expenses/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return handleResponse<ExpenseItem>(res);
+}
+
+export async function deleteExpenseApi(id: string): Promise<void> {
+  const res = await safeFetch(`${API_BASE}/admin/expenses/${id}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok && res.status !== 204) {
+    throw new Error('Failed to delete expense');
+  }
 }
 
 // ---------------------------------------------------------------------------

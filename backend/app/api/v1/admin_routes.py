@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import get_db, get_optional_auth_user, require_admin_role
 from app.core.config import settings
 from app.core.security import create_admin_token
-from app.models.entities import Station, Session, Order, OrderItem, MenuItem, User
+from app.models.entities import Station, Session, Order, OrderItem, MenuItem, User, Expense
 from app.models.enums import SessionStatus, OrderStatus, PaymentStatus, StationStatus
 from app.schemas.api_schemas import (
     StationLiveResponse,
@@ -39,6 +39,13 @@ from app.schemas.api_schemas import (
     StationMatrixResponse,
     SessionExtendRequest,
     SessionAdvanceUpdateRequest,
+    ExpenseCreate,
+    ExpenseUpdate,
+    ExpenseResponse,
+    FinancialDashboardResponse,
+    FinancialPeriodSummary,
+    CategoryExpenseBreakdown,
+    ExpenseInsights,
 )
 from app.services.order_service import serialize_order, ensure_utc, CURRENCY_QUANTIZATION, sum_order_charges
 from app.services.session_service import (
@@ -1598,4 +1605,249 @@ async def get_revenue_analytics(
             "topSellingItem": "None",
             "chartData": [],
         }
+
+
+# ---------------------------------------------------------------------------
+# FINANCIAL SUMMARY & EXPENDITURE LOGGER (Revenue & Profit Dashboard)
+# ---------------------------------------------------------------------------
+
+DEFAULT_SEED_EXPENSES = [
+    {"date": "2026-11-20", "category": "cafe exp", "description": "Kamwali cafe", "amount": Decimal("2000.00")},
+    {"date": "2026-11-20", "category": "mis. exp", "description": "vanya savings", "amount": Decimal("500.00")},
+    {"date": "2026-11-20", "category": "Home exp", "description": "kirana wala", "amount": Decimal("5400.00")},
+    {"date": "2026-11-20", "category": "Home exp", "description": "papa", "amount": Decimal("500.00")},
+    {"date": "2026-11-20", "category": "food exp", "description": "breads", "amount": Decimal("355.00")},
+    {"date": "2026-11-20", "category": "food exp", "description": "milk", "amount": Decimal("100.00")},
+    {"date": "2026-11-20", "category": "Home exp", "description": "rice", "amount": Decimal("3100.00")},
+    {"date": "2026-11-21", "category": "food exp", "description": "milk", "amount": Decimal("100.00")},
+    {"date": "2026-11-21", "category": "cafe exp", "description": "pizza bread", "amount": Decimal("780.00")},
+    {"date": "2026-11-21", "category": "cafe exp", "description": "cheese momo french fry", "amount": Decimal("2175.00")},
+]
+
+
+@router.get("/analytics/financial-dashboard", response_model=FinancialDashboardResponse)
+async def get_financial_dashboard(
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns full Revenue & Profit Dashboard data:
+    1. Financial Summary: Today, Weekly, Monthly, All-time (Revenue, Expenditures, Profit)
+    2. Category Expense Breakdown
+    3. Expense Insights & Summary KPIs
+    4. Editable Expense Log
+    """
+    # Auto-seed initial expenses if empty
+    exp_count = (await db.execute(select(func.count(Expense.id)))).scalar() or 0
+    if exp_count == 0:
+        for seed in DEFAULT_SEED_EXPENSES:
+            db.add(Expense(**seed))
+        await db.commit()
+
+    # Query all expenses ordered by date desc, created_at desc
+    exp_stmt = select(Expense).order_by(Expense.date.desc(), Expense.created_at.desc())
+    expenses_db = (await db.execute(exp_stmt)).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+    week_cutoff_str = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    month_cutoff_str = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
+    month_start = now - timedelta(days=30)
+
+    # Compute Revenue from completed sessions
+    sess_stmt = select(Session).where(Session.status == SessionStatus.COMPLETED.value)
+    sessions = (await db.execute(sess_stmt)).scalars().all()
+
+    today_rev = sum((s.total_amount for s in sessions if (s.ended_at or s.started_at) >= today_start), Decimal("0.00"))
+    week_rev = sum((s.total_amount for s in sessions if (s.ended_at or s.started_at) >= week_start), Decimal("0.00"))
+    month_rev = sum((s.total_amount for s in sessions if (s.ended_at or s.started_at) >= month_start), Decimal("0.00"))
+    all_time_rev = sum((s.total_amount for s in sessions), Decimal("0.00"))
+
+    # Compute Expenditures from expenses
+    today_exp = sum((e.amount for e in expenses_db if e.date >= today_str), Decimal("0.00"))
+    week_exp = sum((e.amount for e in expenses_db if e.date >= week_cutoff_str), Decimal("0.00"))
+    month_exp = sum((e.amount for e in expenses_db if e.date >= month_cutoff_str), Decimal("0.00"))
+    all_time_exp = sum((e.amount for e in expenses_db), Decimal("0.00"))
+
+    financial_summary = {
+        "today": FinancialPeriodSummary(
+            revenue=float(today_rev),
+            expenditures=float(today_exp),
+            profit=float(today_rev - today_exp),
+        ),
+        "weekly": FinancialPeriodSummary(
+            revenue=float(week_rev),
+            expenditures=float(week_exp),
+            profit=float(week_rev - week_exp),
+        ),
+        "monthly": FinancialPeriodSummary(
+            revenue=float(month_rev),
+            expenditures=float(month_exp),
+            profit=float(month_rev - month_exp),
+        ),
+        "allTime": FinancialPeriodSummary(
+            revenue=float(all_time_rev),
+            expenditures=float(all_time_exp),
+            profit=float(all_time_rev - all_time_exp),
+        ),
+    }
+
+    # Category Expense Breakdown
+    category_totals: dict[str, Decimal] = defaultdict(Decimal)
+    for e in expenses_db:
+        category_totals[e.category] += e.amount
+
+    category_breakdown: list[CategoryExpenseBreakdown] = []
+    # Standard baseline categories
+    standard_categories = ["Food", "Electricity", "Rent", "Other Miscellaneous"]
+    for cat in standard_categories:
+        cat_lower = cat.lower()
+        matched_sum = Decimal("0.00")
+        for k, v in list(category_totals.items()):
+            if cat_lower in k.lower() or (cat_lower == "food" and "food" in k.lower()):
+                matched_sum += v
+        pct = float((matched_sum / all_time_exp * 100)) if all_time_exp > 0 else 0.0
+        category_breakdown.append(CategoryExpenseBreakdown(category=cat, amount=float(matched_sum), percentage=round(pct, 1)))
+
+    # Additional custom logged categories
+    for cat_name, amt in sorted(category_totals.items(), key=lambda x: x[1], reverse=True):
+        if not any(cat_name.lower() in std.lower() or std.lower() in cat_name.lower() for std in standard_categories):
+            pct = float((amt / all_time_exp * 100)) if all_time_exp > 0 else 0.0
+            category_breakdown.append(CategoryExpenseBreakdown(category=cat_name, amount=float(amt), percentage=round(pct, 1)))
+
+    # Insights
+    active_count = len(expenses_db)
+    avg_expense = float(all_time_exp / Decimal(str(active_count))) if active_count > 0 else 0.0
+    highest_expense = float(max((e.amount for e in expenses_db), default=Decimal("0.00")))
+
+    food_exp_total = sum((e.amount for e in expenses_db if "food" in e.category.lower()), Decimal("0.00"))
+    food_share = float((food_exp_total / all_time_exp * 100)) if all_time_exp > 0 else 0.0
+
+    util_exp_total = sum((e.amount for e in expenses_db if any(u in e.category.lower() for u in ("elec", "rent", "util"))), Decimal("0.00"))
+    util_share = float((util_exp_total / all_time_exp * 100)) if all_time_exp > 0 else 0.0
+
+    insights = ExpenseInsights(
+        totalExpenses=float(all_time_exp),
+        activeExpenseCount=active_count,
+        averageExpense=round(avg_expense, 0),
+        highestExpense=highest_expense,
+        foodExpenseShare=round(food_share, 1),
+        utilitiesRentShare=round(util_share, 1),
+    )
+
+    return FinancialDashboardResponse(
+        financialSummary=financial_summary,
+        categoryBreakdown=category_breakdown,
+        insights=insights,
+        expenses=[
+            ExpenseResponse(
+                id=e.id,
+                date=e.date,
+                category=e.category,
+                description=e.description,
+                amount=float(e.amount),
+                created_at=e.created_at,
+            )
+            for e in expenses_db
+        ],
+    )
+
+
+@router.get("/expenses", response_model=List[ExpenseResponse])
+async def list_expenses(
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List all recorded business expenses.
+    """
+    stmt = select(Expense).order_by(Expense.date.desc(), Expense.created_at.desc())
+    res = await db.execute(stmt)
+    return res.scalars().all()
+
+
+@router.post("/expenses", response_model=ExpenseResponse, status_code=status.HTTP_201_CREATED)
+async def create_expense(
+    payload: ExpenseCreate,
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Log a new expenditure record.
+    """
+    expense = Expense(
+        date=payload.date.strip(),
+        category=payload.category.strip(),
+        description=payload.description.strip(),
+        amount=payload.amount,
+    )
+    db.add(expense)
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="EXPENSE_LOGGED",
+        payload={"action": "CREATE", "category": expense.category, "amount": str(expense.amount)},
+    )
+    await db.commit()
+    await db.refresh(expense)
+    return expense
+
+
+@router.patch("/expenses/{expense_id}", response_model=ExpenseResponse)
+async def update_expense(
+    expense_id: uuid.UUID,
+    payload: ExpenseUpdate,
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update an existing expense log entry.
+    """
+    expense = await db.get(Expense, expense_id)
+    if not expense:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found")
+    if payload.date is not None:
+        expense.date = payload.date.strip()
+    if payload.category is not None:
+        expense.category = payload.category.strip()
+    if payload.description is not None:
+        expense.description = payload.description.strip()
+    if payload.amount is not None:
+        expense.amount = payload.amount
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="EXPENSE_LOGGED",
+        payload={"action": "UPDATE", "id": str(expense.id), "amount": str(expense.amount)},
+    )
+    await db.commit()
+    await db.refresh(expense)
+    return expense
+
+
+@router.delete("/expenses/{expense_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_expense(
+    expense_id: uuid.UUID,
+    admin_user: User = Depends(require_admin_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Remove an expense entry.
+    """
+    expense = await db.get(Expense, expense_id)
+    if not expense:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found")
+    await db.delete(expense)
+    buffer_ws_event(
+        db,
+        channel="admin",
+        event_type="EXPENSE_LOGGED",
+        payload={"action": "DELETE", "id": str(expense.id)},
+    )
+    await db.commit()
+    return None
+
 

@@ -31,15 +31,19 @@ function checkPortOpen(host, port, timeoutMs = 500) {
 }
 
 async function main() {
-  // Detect Python executable (prefer local .venv)
+  // Detect Python executable (prefer local venv or .venv)
   let pythonCmd = 'python';
-  const winVenv = path.join(backendDir, '.venv', 'Scripts', 'python.exe');
-  const unixVenv = path.join(backendDir, '.venv', 'bin', 'python');
-
-  if (fs.existsSync(winVenv)) {
-    pythonCmd = winVenv;
-  } else if (fs.existsSync(unixVenv)) {
-    pythonCmd = unixVenv;
+  const venvCandidates = [
+    path.join(backendDir, 'venv', 'Scripts', 'python.exe'),
+    path.join(backendDir, '.venv', 'Scripts', 'python.exe'),
+    path.join(backendDir, 'venv', 'bin', 'python'),
+    path.join(backendDir, '.venv', 'bin', 'python'),
+  ];
+  for (const cand of venvCandidates) {
+    if (fs.existsSync(cand)) {
+      pythonCmd = cand;
+      break;
+    }
   }
 
   const isTest = process.argv.includes('--test');

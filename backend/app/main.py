@@ -112,16 +112,18 @@ async def ensure_canonical_domain_hierarchy():
     async with async_session_factory() as db:
         logger.info("Verifying canonical domain hierarchy and physical device registry...")
 
-        # 1. Registered Physical Consoles
+        # 1. Registered Physical Consoles (Batch fetched to avoid N+1 startup queries)
         canonical_consoles = [
             {"id": "PS1", "name": "PS1", "device_type": "CONSOLE"},
             {"id": "PS2", "name": "PS2", "device_type": "CONSOLE"},
             {"id": "PS3", "name": "PS3", "device_type": "CONSOLE"},
             {"id": "VR1", "name": "VR1", "device_type": "VR"},
         ]
+        dev_ids = [d["id"] for d in canonical_consoles]
+        existing_devs = (await db.execute(select(PhysicalDevice).where(PhysicalDevice.id.in_(dev_ids)))).scalars().all()
+        existing_dev_ids = {d.id for d in existing_devs}
         for dev_data in canonical_consoles:
-            existing_dev = await db.get(PhysicalDevice, dev_data["id"])
-            if not existing_dev:
+            if dev_data["id"] not in existing_dev_ids:
                 db.add(PhysicalDevice(**dev_data, status=StationStatus.AVAILABLE.value))
 
         # 2. Canonical Top-Level Stations Specs
@@ -241,16 +243,15 @@ async def ensure_canonical_domain_hierarchy():
         active_device_map = {s.device_name.upper(): s for s in active_sessions if s.device_name}
         active_station_ids = {s.station_id for s in active_sessions}
 
-        for dev_id in ["PS1", "PS2", "PS3", "VR1"]:
-            pdev = await db.get(PhysicalDevice, dev_id)
-            if pdev:
-                active_s = active_device_map.get(dev_id)
-                if active_s:
-                    pdev.status = StationStatus.OCCUPIED.value
-                    pdev.current_session_id = active_s.id
-                else:
-                    pdev.status = StationStatus.AVAILABLE.value
-                    pdev.current_session_id = None
+        all_pdevs = (await db.execute(select(PhysicalDevice).where(PhysicalDevice.id.in_(["PS1", "PS2", "PS3", "VR1"])))).scalars().all()
+        for pdev in all_pdevs:
+            active_s = active_device_map.get(pdev.id)
+            if active_s:
+                pdev.status = StationStatus.OCCUPIED.value
+                pdev.current_session_id = active_s.id
+            else:
+                pdev.status = StationStatus.AVAILABLE.value
+                pdev.current_session_id = None
 
         for canon_st in created_or_found_canonical.values():
             if canon_st.id in active_station_ids:

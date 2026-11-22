@@ -300,4 +300,47 @@ export interface StationMatrixData {
   cafe_sessions?: MatrixSession[];
 }
 
+export interface ExpenseItem {
+  id: string;
+  date: string;
+  category: string;
+  description: string;
+  amount: number;
+  created_at?: string;
+}
+
+export interface FinancialPeriodSummary {
+  revenue: number;
+  expenditures: number;
+  profit: number;
+}
+
+export interface CategoryExpenseBreakdown {
+  category: string;
+  amount: number;
+  percentage: number;
+}
+
+export interface ExpenseInsights {
+  totalExpenses: number;
+  activeExpenseCount: number;
+  averageExpense: number;
+  highestExpense: number;
+  foodExpenseShare: number;
+  utilitiesRentShare: number;
+}
+
+export interface FinancialDashboardData {
+  financialSummary: {
+    today: FinancialPeriodSummary;
+    weekly: FinancialPeriodSummary;
+    monthly: FinancialPeriodSummary;
+    allTime: FinancialPeriodSummary;
+  };
+  categoryBreakdown: CategoryExpenseBreakdown[];
+  insights: ExpenseInsights;
+  expenses: ExpenseItem[];
+}
+
+
 
